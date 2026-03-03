@@ -18,15 +18,6 @@ Reads your (responses, scores, activations, vectors, axis) and produces:
   - axis_default_rolemean_cosine_by_layer.png
 
 CPU-only. No OpenAI calls. No GPU needed.
-
-Example:
-python assistant_axis_report.py \
-  --responses_dir /mnt/dlab/scratch/dlabscratch1/bazina/assistant_axis_outputs/llama-3.1-8b/responses_q50 \
-  --scores_dir    /mnt/dlab/scratch/dlabscratch1/bazina/assistant_axis_outputs/llama-3.1-8b/scores_q50 \
-  --activations_dir /mnt/dlab/scratch/dlabscratch1/bazina/assistant_axis_outputs/llama-3.1-8b/activations \
-  --vectors_dir   /mnt/dlab/scratch/dlabscratch1/bazina/assistant_axis_outputs/llama-3.1-8b/vectors_q50 \
-  --axis_path     /mnt/dlab/scratch/dlabscratch1/bazina/assistant_axis_outputs/llama-3.1-8b/axis_q50.pt \
-  --out_dir       /mnt/dlab/scratch/dlabscratch1/bazina/assistant_axis_outputs/llama-3.1-8b/report_q50
 """
 
 from __future__ import annotations
@@ -34,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -44,7 +34,7 @@ import torch
 # Optional deps (we’ll fail gracefully with clear messages)
 try:
     import matplotlib.pyplot as plt
-except Exception as e:
+except Exception:
     plt = None
 
 try:
@@ -75,6 +65,8 @@ def _torch_load(path: Path):
 
 def _cosine(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-9) -> float:
     # a,b: (hidden_dim,)
+    a = a.float()
+    b = b.float()
     na = torch.norm(a).item()
     nb = torch.norm(b).item()
     if na < eps or nb < eps:
@@ -107,8 +99,7 @@ def load_scores_dir(scores_dir: Path) -> Dict[str, Dict[str, int]]:
         role = f.stem
         try:
             d = _read_json(f)
-            # ensure int scores
-            dd = {}
+            dd: Dict[str, int] = {}
             for k, v in d.items():
                 iv = _safe_int(v)
                 if iv is None:
@@ -142,7 +133,6 @@ def summarize_scores(scores_by_role: Dict[str, Dict[str, int]]) -> Tuple[List[Ro
 
 
 def count_jsonl_rows(path: Path) -> int:
-    # Fast line count
     try:
         with path.open("rb") as f:
             return sum(1 for _ in f)
@@ -198,11 +188,13 @@ def load_vectors_dir(vectors_dir: Path) -> Dict[str, dict]:
 
 def vector_layer_norms(vec: torch.Tensor) -> torch.Tensor:
     # vec: (n_layers, hidden_dim)
-    return torch.norm(vec, dim=1)
+    # Ensure float dtype so matplotlib + numpy are happy (bf16 causes TypeError)
+    return torch.norm(vec.float(), dim=1)
 
 
 def mean_vector(vectors: List[torch.Tensor]) -> torch.Tensor:
-    return torch.stack(vectors).mean(dim=0)
+    # keep compute stable even if inputs are bf16
+    return torch.stack([v.float() for v in vectors]).mean(dim=0)
 
 
 def plot_or_skip(fig_path: Path) -> bool:
@@ -269,7 +261,6 @@ def main() -> None:
         report["scores"]["per_role_max_rate3"] = per_role_scores[-1].rate3 if per_role_scores else None
         report["scores"]["min_count_threshold"] = args.min_count
 
-        # pass/fail vs min_count
         if per_role_scores:
             n_pass = sum(1 for r in per_role_scores if r.n3 >= args.min_count)
             n_fail = sum(1 for r in per_role_scores if r.n3 < args.min_count)
@@ -295,7 +286,6 @@ def main() -> None:
         vectors = load_vectors_dir(vectors_dir)
         report["counts"]["vectors"] = {"n_files": len(vectors)}
 
-        # categorize
         for role, d in vectors.items():
             v = d["vector"]
             vtype = str(d.get("type", "unknown"))
@@ -310,21 +300,23 @@ def main() -> None:
         report["vectors"]["n_role_vectors"] = len(role_vectors)
         report["vectors"]["default_roles"] = default_roles
 
-        # norms summary per role
         vec_rows = []
         for role, d in vectors.items():
             v = d["vector"]
             vtype = str(d.get("type", "unknown"))
             ln = vector_layer_norms(v)
-            vec_rows.append({
-                "role": role,
-                "type": vtype,
-                "n_layers": int(v.shape[0]),
-                "hidden_dim": int(v.shape[1]),
-                "mean_layer_norm": float(ln.mean().item()),
-                "max_layer_norm": float(ln.max().item()),
-                "max_layer_norm_layer": int(torch.argmax(ln).item()),
-            })
+            vec_rows.append(
+                {
+                    "role": role,
+                    "type": vtype,
+                    "n_layers": int(v.shape[0]),
+                    "hidden_dim": int(v.shape[1]),
+                    "mean_layer_norm": float(ln.mean().item()),
+                    "max_layer_norm": float(ln.max().item()),
+                    "max_layer_norm_layer": int(torch.argmax(ln).item()),
+                }
+            )
+
         report["vectors"]["role_norms_summary"] = {
             "mean_of_mean_layer_norm": float(sum(r["mean_layer_norm"] for r in vec_rows) / max(1, len(vec_rows))),
             "mean_of_max_layer_norm": float(sum(r["max_layer_norm"] for r in vec_rows) / max(1, len(vec_rows))),
@@ -334,7 +326,6 @@ def main() -> None:
         if pd is not None:
             pd.DataFrame(vec_rows).sort_values(["type", "role"]).to_csv(out_dir / "vectors_summary.csv", index=False)
         else:
-            # minimal CSV writer
             csv_path = out_dir / "vectors_summary.csv"
             with csv_path.open("w", encoding="utf-8") as f:
                 cols = list(vec_rows[0].keys()) if vec_rows else []
@@ -342,12 +333,10 @@ def main() -> None:
                 for r in vec_rows:
                     f.write(",".join(str(r[c]) for c in cols) + "\n")
 
-        # Compute means if possible
         if default_vectors and role_vectors:
             default_mean = mean_vector(default_vectors)
             role_mean = mean_vector(role_vectors)
 
-            # layer norms of means
             dm_ln = vector_layer_norms(default_mean)
             rm_ln = vector_layer_norms(role_mean)
 
@@ -356,22 +345,21 @@ def main() -> None:
             report["vectors"]["default_mean_layer_norm_mean"] = float(dm_ln.mean().item())
             report["vectors"]["role_mean_layer_norm_mean"] = float(rm_ln.mean().item())
 
-            # cosine(default_mean, role_mean) per layer
-            cos_by_layer = []
+            cos_by_layer: List[float] = []
             for i in range(default_mean.shape[0]):
                 cos_by_layer.append(_cosine(default_mean[i], role_mean[i]))
             report["vectors"]["cosine_default_mean_vs_role_mean_by_layer"] = {
                 "mean": float(torch.tensor([c for c in cos_by_layer if not math.isnan(c)]).mean().item())
-                if cos_by_layer else None,
+                if cos_by_layer
+                else None,
                 "min": float(min(cos_by_layer)) if cos_by_layer else None,
                 "max": float(max(cos_by_layer)) if cos_by_layer else None,
             }
 
-            # Plot: default vs role mean layer norms
             if plot_or_skip(out_dir / "vector_layer_norms_default_vs_role_mean.png"):
                 plt.figure()
-                plt.plot(dm_ln.numpy(), label="default_mean layer norm")
-                plt.plot(rm_ln.numpy(), label="role_mean layer norm")
+                plt.plot(dm_ln.float().numpy(), label="default_mean layer norm")
+                plt.plot(rm_ln.float().numpy(), label="role_mean layer norm")
                 plt.title("Layer norms: default_mean vs role_mean")
                 plt.xlabel("Layer")
                 plt.ylabel("L2 norm")
@@ -380,7 +368,6 @@ def main() -> None:
                 plt.savefig(out_dir / "vector_layer_norms_default_vs_role_mean.png")
                 plt.close()
 
-            # Plot: cosine per layer
             if plot_or_skip(out_dir / "axis_default_rolemean_cosine_by_layer.png"):
                 plt.figure()
                 plt.plot(cos_by_layer)
@@ -390,7 +377,6 @@ def main() -> None:
                 plt.tight_layout()
                 plt.savefig(out_dir / "axis_default_rolemean_cosine_by_layer.png")
                 plt.close()
-
         else:
             report["notes"].append("Could not compute default_mean/role_mean (missing default_vectors or role_vectors).")
     else:
@@ -405,13 +391,15 @@ def main() -> None:
                 axis = axis["axis"]
             if not torch.is_tensor(axis):
                 raise ValueError("axis file did not contain a Tensor")
+
+            axis = axis.float()
+
             report["axis"]["shape"] = [int(axis.shape[0]), int(axis.shape[1])]
             norms = vector_layer_norms(axis)
             report["axis"]["mean_layer_norm"] = float(norms.mean().item())
             report["axis"]["max_layer_norm"] = float(norms.max().item())
             report["axis"]["argmax_layer_norm_layer"] = int(torch.argmax(norms).item())
 
-            # Save norms CSV
             rows = [{"layer": i, "axis_layer_norm": float(n.item())} for i, n in enumerate(norms)]
             if pd is not None:
                 pd.DataFrame(rows).to_csv(out_dir / "axis_layer_norms.csv", index=False)
@@ -421,10 +409,9 @@ def main() -> None:
                     for r in rows:
                         f.write(f"{r['layer']},{r['axis_layer_norm']}\n")
 
-            # Plot norms
             if plot_or_skip(out_dir / "axis_layer_norms.png"):
                 plt.figure()
-                plt.plot(norms.numpy())
+                plt.plot(norms.float().numpy())
                 plt.title("Assistant Axis: per-layer L2 norms")
                 plt.xlabel("Layer")
                 plt.ylabel("L2 norm")
@@ -434,10 +421,9 @@ def main() -> None:
 
             # If we have default_mean and role_mean, sanity check axis = default_mean - role_mean
             if vectors_dir and vectors_dir.exists():
-                # recompute quickly if possible
                 vectors = vectors if vectors else load_vectors_dir(vectors_dir)
-                dv = []
-                rv = []
+                dv: List[torch.Tensor] = []
+                rv: List[torch.Tensor] = []
                 for role, d in vectors.items():
                     v = d["vector"]
                     vtype = str(d.get("type", "unknown"))
@@ -448,7 +434,7 @@ def main() -> None:
                 if dv and rv:
                     dm = mean_vector(dv)
                     rm = mean_vector(rv)
-                    axis_recon = dm - rm
+                    axis_recon = (dm - rm).float()
                     diff = torch.norm(axis - axis_recon).item()
                     rel = diff / (torch.norm(axis_recon).item() + 1e-9)
                     report["axis"]["reconstruction_check"] = {
@@ -464,19 +450,20 @@ def main() -> None:
 
     # ---------- Score plots + CSV ----------
     if scores_by_role:
-        # CSV per role
         rows = []
         for r in per_role_scores:
-            rows.append({
-                "role": r.role,
-                "n_total": r.n_total,
-                "n0": r.n0,
-                "n1": r.n1,
-                "n2": r.n2,
-                "n3": r.n3,
-                "rate3": r.rate3,
-                "passes_min_count": int(r.n3 >= args.min_count),
-            })
+            rows.append(
+                {
+                    "role": r.role,
+                    "n_total": r.n_total,
+                    "n0": r.n0,
+                    "n1": r.n1,
+                    "n2": r.n2,
+                    "n3": r.n3,
+                    "rate3": r.rate3,
+                    "passes_min_count": int(r.n3 >= args.min_count),
+                }
+            )
         if pd is not None:
             pd.DataFrame(rows).sort_values("rate3").to_csv(out_dir / "role_scores_summary.csv", index=False)
         else:
@@ -487,10 +474,14 @@ def main() -> None:
                         f"{rr['role']},{rr['n_total']},{rr['n0']},{rr['n1']},{rr['n2']},{rr['n3']},{rr['rate3']},{rr['passes_min_count']}\n"
                     )
 
-        # Overall score distribution plot
         if plot_or_skip(out_dir / "score_distribution_overall.png"):
             plt.figure()
-            counts = [overall_scores.get("n0", 0), overall_scores.get("n1", 0), overall_scores.get("n2", 0), overall_scores.get("n3", 0)]
+            counts = [
+                overall_scores.get("n0", 0),
+                overall_scores.get("n1", 0),
+                overall_scores.get("n2", 0),
+                overall_scores.get("n3", 0),
+            ]
             plt.bar([0, 1, 2, 3], counts)
             plt.title("Overall judge score distribution")
             plt.xlabel("Score")
@@ -499,9 +490,7 @@ def main() -> None:
             plt.savefig(out_dir / "score_distribution_overall.png")
             plt.close()
 
-        # Score-3 rate by role plot (sorted)
         if plot_or_skip(out_dir / "score3_rate_by_role.png"):
-            # show top_k best + top_k worst to keep plot readable
             sorted_roles = sorted(rows, key=lambda x: x["rate3"])
             worst = sorted_roles[: min(args.top_k_roles, len(sorted_roles))]
             best = sorted_roles[-min(args.top_k_roles, len(sorted_roles)) :]
@@ -537,7 +526,9 @@ def main() -> None:
         print(f"Roles pass min_count({args.min_count}): {report['scores'].get('roles_pass_min_count')}")
     if "vectors" in report["counts"]:
         print(f"Vectors files: {report['counts']['vectors']['n_files']}")
-        print(f"Default vectors: {report['vectors'].get('n_default_vectors')}, role vectors: {report['vectors'].get('n_role_vectors')}")
+        print(
+            f"Default vectors: {report['vectors'].get('n_default_vectors')}, role vectors: {report['vectors'].get('n_role_vectors')}"
+        )
     if report["axis"].get("shape"):
         print(f"Axis shape: {report['axis']['shape']}")
         rc = report["axis"].get("reconstruction_check")
