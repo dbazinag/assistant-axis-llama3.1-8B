@@ -62,13 +62,13 @@ ROLE_PROMPTS = [
 ]
 
 # Fractions of avg norm — matches paper Figure 4 x-axis for Llama-scale models
-FRACTIONS   = [0.0, +0.05, +0.15, -0.05, -0.15]
+FRACTIONS   = [0.0, +0.15, +0.40, -0.15, -0.40]
 FRAC_LABELS = [
     "baseline",
-    "+0.05 × norm  (mild → more Assistant-like)",
-    "+0.15 × norm  (strong → more Assistant-like)",
-    "-0.05 × norm  (mild → drift from Assistant)",
-    "-0.15 × norm  (strong → drift from Assistant)",
+    "+0.15 × norm  (mild → more Assistant-like)",
+    "+0.40 × norm  (strong → more Assistant-like)",
+    "-0.15 × norm  (mild → drift from Assistant)",
+    "-0.40 × norm  (strong → drift from Assistant)",
 ]
 
 
