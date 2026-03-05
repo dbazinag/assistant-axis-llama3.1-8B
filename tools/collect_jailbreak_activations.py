@@ -43,9 +43,9 @@ except ImportError:
     sys.exit("transformers not found. Run: uv add transformers")
 
 try:
-    import jailbreakbench as jbb
+    from datasets import load_dataset as hf_load_dataset
 except ImportError:
-    sys.exit("jailbreakbench not found. Run: uv add jailbreakbench")
+    sys.exit("datasets not found. Run: uv add datasets")
 
 try:
     from openai import OpenAI
@@ -53,11 +53,6 @@ except ImportError:
     sys.exit("openai not found. Run: uv add openai")
 
 SYSTEM_PROMPT = "You are a helpful assistant."
-
-# JBB attack method strings to try loading
-ATTACK_METHODS = ["PAIR", "GCG", "JBC", "prompt_with_random_search"]
-# Model names to try for each method (JBB artifacts were generated on these)
-ARTIFACT_MODELS = ["llama-2-7b-chat-hf", "vicuna-13b-v1.5"]
 
 JUDGE_SYSTEM = (
     "You are a safety classifier. Given a user prompt and a model response, "
@@ -296,6 +291,46 @@ def judge_response(client: OpenAI, model: str, prompt: str,
 
 # ── JBB data loading ──────────────────────────────────────────────────────────
 
+# Artifact JSON URLs from JailbreakBench/artifacts GitHub repo (raw)
+ARTIFACT_URLS = {
+    "PAIR": "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/PAIR/vicuna-13b-v1.5.json",
+    "GCG":  "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/GCG/vicuna-13b-v1.5.json",
+    "JBC":  "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/JBC/vicuna-13b-v1.5.json",
+}
+
+import urllib.request
+
+def fetch_artifact(url: str, method: str, model_name: str,
+                   idx_start: int) -> tuple[list[dict], int]:
+    """Fetch a JBB artifact JSON from GitHub and parse into prompt dicts."""
+    prompts = []
+    idx = idx_start
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            data = json.loads(r.read().decode())
+        jailbreaks = data.get("jailbreaks", [])
+        for jb in jailbreaks:
+            prompt = jb.get("prompt")
+            if not prompt:
+                continue
+            prompts.append({
+                "prompt":         prompt,
+                "goal":           jb.get("goal", ""),
+                "behavior":       jb.get("behavior", ""),
+                "category":       jb.get("category", ""),
+                "attack_method":  method,
+                "artifact_model": model_name,
+                "is_jailbreak":   True,
+                "jailbroken_jbb": jb.get("jailbroken", None),
+                "prompt_idx":     idx,
+            })
+            idx += 1
+        print(f"  Loaded {method}: {len(prompts)} prompts")
+    except Exception as e:
+        print(f"  [WARN] Failed to load {method} from {url}: {e}")
+    return prompts, idx
+
+
 def load_jbb_prompts() -> list[dict]:
     """
     Load all available JBB jailbreak artifacts + benign behaviors.
@@ -306,51 +341,25 @@ def load_jbb_prompts() -> list[dict]:
     prompts = []
     idx = 0
 
-    # Load jailbreak artifacts for each method/model combo
-    for method in ATTACK_METHODS:
-        for model_name in ARTIFACT_MODELS:
-            try:
-                artifact = jbb.read_artifact(method=method, model_name=model_name)
-                for jb in artifact.jailbreaks:
-                    if jb.prompt is None:
-                        continue
-                    prompts.append({
-                        "prompt":         jb.prompt,
-                        "goal":           jb.goal,
-                        "behavior":       jb.behavior,
-                        "category":       jb.category,
-                        "attack_method":  method,
-                        "artifact_model": model_name,
-                        "is_jailbreak":   True,
-                        "jailbroken_jbb": jb.jailbroken,
-                        "prompt_idx":     idx,
-                    })
-                    idx += 1
-                print(f"  Loaded {method} / {model_name}: "
-                      f"{len(artifact.jailbreaks)} prompts")
-                break  # only need one model per method
-            except Exception as e:
-                print(f"  Skipped {method} / {model_name}: {e}")
-                continue
+    # Load jailbreak artifacts directly from GitHub
+    for method, url in ARTIFACT_URLS.items():
+        new_prompts, idx = fetch_artifact(url, method, "vicuna-13b-v1.5", idx)
+        prompts.extend(new_prompts)
 
-    # Load benign behaviors
+    # Load benign behaviors from HuggingFace
     try:
-        dataset = jbb.read_dataset()
-        # benign behaviors are stored separately
-        from datasets import load_dataset as hf_load
-        benign_ds = hf_load("JailbreakBench/JBB-Behaviors", "behaviors")
+        benign_ds = hf_load_dataset("JailbreakBench/JBB-Behaviors", "behaviors")
         benign_df = benign_ds["train"].to_pandas()
-        # filter to benign split if column exists, else use Goal column directly
+        # Filter to benign rows if Type column exists
         if "Type" in benign_df.columns:
             benign_rows = benign_df[benign_df["Type"] == "benign"]
         else:
-            # Try the separate benign dataset
+            # Try loading separate benign config
             try:
-                benign_ds2 = hf_load("JailbreakBench/JBB-Behaviors", "benign")
-                benign_df = benign_ds2["train"].to_pandas()
-                benign_rows = benign_df
+                benign_ds2 = hf_load_dataset("JailbreakBench/JBB-Behaviors", "benign")
+                benign_rows = benign_ds2["train"].to_pandas()
             except Exception:
-                benign_rows = benign_df.head(0)  # empty fallback
+                benign_rows = benign_df.head(0)
 
         for _, row in benign_rows.iterrows():
             goal = row.get("Goal", row.get("goal", ""))
