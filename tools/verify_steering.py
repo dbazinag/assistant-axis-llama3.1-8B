@@ -7,15 +7,15 @@ at multiple coefficients and saves responses for manual inspection.
 
 Coefficients are scaled as fractions of the average residual stream norm
 at the target layer, matching the paper's methodology (Section 3.2.1).
-The paper's Figure 4 x-axis uses this same "fraction of avg norm" scale.
+
+Known file formats (confirmed from actual outputs):
+  axis_q50.pt       — raw tensor, shape (n_layers, hidden_size)
+                      → index with layer_idx to get the vector
+  vectors_q50/*.pt  — dict with keys: 'vector' (n_layers, hidden_size),
+                      'type', 'role'
+                      → use data['vector'][layer_idx]
 
 For Llama 3.1 8B (32 layers), the middle layer is 16.
-
-The axis is a raw tensor of shape (hidden_size,) — one vector for the
-chosen layer, already stored that way in axis_q50.pt.
-
-Role vectors from vectors_q50/ may be stored as either a raw tensor
-(hidden_size,) or a dict keyed by layer index — both are handled.
 
 Usage:
     uv run tools/verify_steering.py \
@@ -28,7 +28,7 @@ Usage:
         --out_file        $BASE/assistant_axis_outputs/llama-3.1-8b/verify_steering.txt
 """
 
-import argparse, json, random, sys, textwrap
+import argparse, random, sys, textwrap
 from pathlib import Path
 
 import torch
@@ -51,12 +51,46 @@ FRAC_LABELS = [
 ]
 
 
+# ── Vector loading ────────────────────────────────────────────────────────────
+
+def load_vector(path: Path, layer_idx: int) -> torch.Tensor:
+    """
+    Load a single-layer steering vector from a .pt file.
+
+    Handles confirmed formats:
+      1. Raw tensor (n_layers, hidden_size)  — axis_q50.pt
+      2. Dict {'vector': (n_layers, hidden_size), ...}  — role vectors
+      3. Dict {layer_idx: (hidden_size,), ...}  — fallback
+    """
+    data = torch.load(path, map_location="cpu", weights_only=True)
+
+    if isinstance(data, dict):
+        # Format 2: role vector files
+        if "vector" in data:
+            t = data["vector"].float()
+            return t[layer_idx] if t.ndim == 2 else t
+
+        # Format 3: keyed by layer index
+        for key in [layer_idx, str(layer_idx)]:
+            if key in data:
+                t = data[key].float()
+                return t[layer_idx] if t.ndim == 2 else t
+
+        raise KeyError(
+            f"Could not find layer vector in {path}. "
+            f"Keys present: {list(data.keys())}"
+        )
+
+    # Format 1: raw tensor
+    t = data.float()
+    return t[layer_idx] if t.ndim == 2 else t
+
+
 # ── Steering hook ─────────────────────────────────────────────────────────────
 
 class AdditionHook:
-    """Adds coeff * unit_vector to the residual stream at a single layer."""
+    """Adds coeff * unit_vector to the residual stream output of a layer."""
     def __init__(self, vector: torch.Tensor, coeff: float):
-        # Normalize to unit vector, then scale by coeff at call time
         self.unit = vector.float() / (vector.float().norm() + 1e-8)
         self.coeff = coeff
         self._handle = None
@@ -85,18 +119,15 @@ def get_layer(model, idx: int):
                 break
         if obj is not None:
             return obj[idx]
-    raise RuntimeError(
-        f"Cannot locate layer {idx} in model. "
-        "Inspect model architecture and update get_layer()."
-    )
+    raise RuntimeError(f"Cannot locate layer {idx}. Check model architecture.")
 
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
 def generate(model, tokenizer, prompt: str, max_new_tokens: int = 200) -> str:
-    messages = [{"role": "user", "content": prompt}]
     ids = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, return_tensors="pt"
+        [{"role": "user", "content": prompt}],
+        add_generation_prompt=True, return_tensors="pt"
     ).to(model.device)
     with torch.no_grad():
         out = model.generate(
@@ -113,10 +144,8 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int = 200) -> str:
 def avg_norm_from_activations(activations_dir: Path, layer_idx: int,
                                max_files: int = 20) -> float | None:
     """
-    Estimate avg residual stream norm from saved .pt activation files.
-    Each file is expected to be either:
-      - a dict {layer_idx: tensor of shape (hidden_size,)}
-      - a raw tensor of shape (hidden_size,)
+    Estimate avg residual stream norm from saved activation .pt files.
+    Uses the same load_vector logic to handle all known formats.
     """
     pts = list(activations_dir.glob("*.pt"))
     if not pts:
@@ -125,20 +154,15 @@ def avg_norm_from_activations(activations_dir: Path, layer_idx: int,
     norms = []
     for p in pts:
         try:
-            data = torch.load(p, map_location="cpu", weights_only=True)
-            if isinstance(data, dict):
-                t = data.get(layer_idx, data.get(str(layer_idx)))
-            else:
-                t = data
-            if t is not None:
-                norms.append(t.float().norm().item())
+            t = load_vector(p, layer_idx)
+            norms.append(t.norm().item())
         except Exception:
             continue
     return float(sum(norms) / len(norms)) if norms else None
 
 
 def avg_norm_from_forward_passes(model, tokenizer, layer_idx: int) -> float:
-    """Fallback: run a few prompts and capture the norm live."""
+    """Fallback: estimate norm by running a few forward passes live."""
     probes = [
         "What is the capital of France?",
         "Explain how photosynthesis works.",
@@ -168,55 +192,28 @@ def avg_norm_from_forward_passes(model, tokenizer, layer_idx: int) -> float:
     return float(sum(norms) / len(norms))
 
 
-# ── Vector loading ────────────────────────────────────────────────────────────
-
-def load_raw_vector(path: Path, layer_idx: int) -> torch.Tensor:
-    """
-    Load a steering vector. Handles:
-      - raw tensor (axis_q50.pt is stored this way)
-      - dict keyed by int or str layer index (some role vectors may be stored this way)
-    """
-    data = torch.load(path, map_location="cpu", weights_only=True)
-    if isinstance(data, dict):
-        for key in [layer_idx, str(layer_idx)]:
-            if key in data:
-                return data[key].float()
-        raise KeyError(
-            f"Layer {layer_idx} not found in {path}. "
-            f"Available keys: {list(data.keys())[:10]}"
-        )
-    # Raw tensor — assumed to already be for the correct layer
-    return data.float()
-
-
-# ── Core test ─────────────────────────────────────────────────────────────────
+# ── Core steering test ────────────────────────────────────────────────────────
 
 def run_test(model, tokenizer, layer_idx: int, vector: torch.Tensor,
-             avg_norm: float, label: str, prompt: str) -> list[dict]:
-    """Runs baseline + 4 steered generations. Returns list of result dicts."""
+             avg_norm: float, prompt: str) -> list[dict]:
+    """Run baseline + 4 steered generations. Returns list of result dicts."""
     layer_mod = get_layer(model, layer_idx)
     results = []
-
     for frac, flabel in zip(FRACTIONS, FRAC_LABELS):
         coeff = frac * avg_norm
-
         hook = None
         if coeff != 0.0:
             hook = AdditionHook(vector.clone(), coeff)
             hook.register(layer_mod)
-
         response = generate(model, tokenizer, prompt)
-
         if hook:
             hook.remove()
-
         results.append({
             "fraction": frac,
-            "coeff": round(coeff, 4),
+            "coeff": round(coeff, 3),
             "label": flabel,
             "response": response,
         })
-
     return results
 
 
@@ -224,18 +221,13 @@ def run_test(model, tokenizer, layer_idx: int, vector: torch.Tensor,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--axis_path",       required=True, type=Path,
-                    help="Path to axis_q50.pt (raw tensor, shape: hidden_size)")
-    ap.add_argument("--vectors_dir",     required=True, type=Path,
-                    help="Dir containing per-role .pt vector files")
-    ap.add_argument("--activations_dir", type=Path, default=None,
-                    help="Dir with saved activation .pt files for norm estimation")
-    ap.add_argument("--model_id",        required=True,
-                    help="HuggingFace model ID")
-    ap.add_argument("--layer",           type=int, default=16,
-                    help="Layer to steer (middle layer for 8B = 16). Default: 16")
+    ap.add_argument("--axis_path",       required=True, type=Path)
+    ap.add_argument("--vectors_dir",     required=True, type=Path)
+    ap.add_argument("--activations_dir", type=Path, default=None)
+    ap.add_argument("--model_id",        required=True)
+    ap.add_argument("--layer",           type=int, default=16)
     ap.add_argument("--roles",           nargs="+", default=None,
-                    help="Role vector file stems to test (e.g. pirate villain). "
+                    help="Role vector stems (e.g. pirate villain). "
                          "Omit to pick 2 at random.")
     ap.add_argument("--prompt",          default=TEST_PROMPT)
     ap.add_argument("--max_new_tokens",  type=int, default=200)
@@ -247,7 +239,7 @@ def main():
     print(f"Loading {args.model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_id, torch_dtype=torch.float16, device_map="auto"
+        args.model_id, dtype=torch.float16, device_map="auto"
     )
     model.eval()
     print("Model loaded.\n")
@@ -265,8 +257,8 @@ def main():
         avg_norm = avg_norm_from_forward_passes(model, tokenizer, args.layer)
         print(f"  avg norm (from forward passes): {avg_norm:.2f}\n")
 
-    # Load axis (raw tensor)
-    axis = load_raw_vector(args.axis_path, args.layer)
+    # Load axis
+    axis = load_vector(args.axis_path, args.layer)
     print(f"Axis loaded: shape={axis.shape}\n")
 
     # Pick role vectors
@@ -278,7 +270,15 @@ def main():
         if role_paths:
             print(f"Auto-selected role vectors: {[p.stem for p in role_paths]}\n")
 
-    # Run tests and collect output
+    # Build list of (label, vector) to test
+    all_vectors = [("assistant_axis", axis)]
+    for p in role_paths:
+        try:
+            all_vectors.append((p.stem, load_vector(p, args.layer)))
+        except Exception as e:
+            print(f"[WARN] Skipping {p.stem}: {e}")
+
+    # Run and collect output
     lines = []
     def emit(s=""):
         print(s)
@@ -289,23 +289,13 @@ def main():
     emit(f"Prompt: {args.prompt}")
     emit("=" * 72)
 
-    all_vectors = [("assistant_axis", axis)] + [
-        (p.stem, load_raw_vector(p, args.layer))
-        for p in role_paths
-        if p.exists()
-    ]
-
     for label, vec in all_vectors:
         emit(f"\n{'─' * 72}")
         emit(f"VECTOR: {label}")
         emit(f"{'─' * 72}")
-
-        results = run_test(model, tokenizer, args.layer, vec, avg_norm,
-                           label, args.prompt)
-
+        results = run_test(model, tokenizer, args.layer, vec, avg_norm, args.prompt)
         for r in results:
             emit(f"\n  [{r['label']}]  (coeff={r['coeff']})")
-            # Wrap response text for readability
             for line in textwrap.wrap(r["response"], width=76):
                 emit(f"    {line}")
 
