@@ -12,11 +12,15 @@ For each prompt in JailbreakBench (jailbreak artifacts + benign behaviors):
   6. Save per-prompt .pt files (raw activations + projections + metadata)
      and a master results.jsonl (metadata + projections, no tensors)
 
-Attack types loaded:
-  - PAIR   (natural language reframing)
-  - GCG    (adversarial suffix)
-  - JBC    (JailbreakChat — persona-based, e.g. AIM/DAN)
-  - benign (100 benign behaviors, no attack wrapper)
+Attack types loaded (all confirmed artifact URLs):
+  - PAIR_vicuna   PAIR optimized on vicuna-13b-v1.5       (black_box, ~82 prompts)
+  - PAIR_gpt35    PAIR optimized on gpt-3.5-turbo-1106    (black_box, ~87 prompts)
+  - PAIR_llama2   PAIR optimized on llama-2-7b-chat-hf    (black_box, ~100 prompts)
+  - GCG           GCG adversarial suffix on vicuna         (white_box, 100 prompts)
+  - JBC           JailbreakChat AIM/DAN persona templates  (manual,    100 prompts)
+  - RS_vicuna     prompt+random_search on vicuna           (black_box, 100 prompts)
+  - RS_gpt4       prompt+random_search on gpt-4            (black_box, 100 prompts)
+  - benign        100 benign behaviors (no attack wrapper)
 
 Usage:
     uv run tools/collect_jailbreak_activations.py \
@@ -61,20 +65,37 @@ JUDGE_SYSTEM = (
     "Respond with exactly one word: 'jailbroken' or 'not_jailbroken'."
 )
 
-# Confirmed correct raw GitHub URLs for JBB attack artifacts:
-#   PAIR: attack-artifacts/PAIR/black_box/vicuna-13b-v1.5.json
-#   GCG:  attack-artifacts/GCG/white_box/vicuna-13b-v1.5.json
-#   JBC:  attack-artifacts/JBC/manual/gpt-4-0125-preview.json
+# All confirmed artifact URLs from github.com/JailbreakBench/artifacts
+#
+# PAIR/black_box:
+#   vicuna-13b-v1.5       -> attack-artifacts/PAIR/black_box/vicuna-13b-v1.5.json
+#   gpt-3.5-turbo-1106    -> attack-artifacts/PAIR/black_box/gpt-3.5-turbo-1106.json
+#   llama-2-7b-chat-hf    -> attack-artifacts/PAIR/black_box/llama-2-7b-chat-hf.json
+# GCG/white_box:
+#   vicuna-13b-v1.5       -> attack-artifacts/GCG/white_box/vicuna-13b-v1.5.json
+# JBC/manual:
+#   gpt-4-0125-preview    -> attack-artifacts/JBC/manual/gpt-4-0125-preview.json
+# prompt_with_random_search/black_box:
+#   vicuna-13b-v1.5       -> attack-artifacts/prompt_with_random_search/black_box/vicuna-13b-v1.5.json
+#   gpt-4-0125-preview    -> attack-artifacts/prompt_with_random_search/black_box/gpt-4-0125-preview.json
 ARTIFACT_URLS = {
-    "PAIR": "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/PAIR/black_box/vicuna-13b-v1.5.json",
-    "GCG":  "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/GCG/white_box/vicuna-13b-v1.5.json",
-    "JBC":  "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/JBC/manual/gpt-4-0125-preview.json",
+    "PAIR_vicuna": "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/PAIR/black_box/vicuna-13b-v1.5.json",
+    "PAIR_gpt35":  "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/PAIR/black_box/gpt-3.5-turbo-1106.json",
+    "PAIR_llama2": "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/PAIR/black_box/llama-2-7b-chat-hf.json",
+    "GCG":         "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/GCG/white_box/vicuna-13b-v1.5.json",
+    "JBC":         "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/JBC/manual/gpt-4-0125-preview.json",
+    "RS_vicuna":   "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/prompt_with_random_search/black_box/vicuna-13b-v1.5.json",
+    "RS_gpt4":     "https://raw.githubusercontent.com/JailbreakBench/artifacts/main/attack-artifacts/prompt_with_random_search/black_box/gpt-4-0125-preview.json",
 }
 
 ARTIFACT_MODEL_NAMES = {
-    "PAIR": "vicuna-13b-v1.5",
-    "GCG":  "vicuna-13b-v1.5",
-    "JBC":  "gpt-4-0125-preview",
+    "PAIR_vicuna": "vicuna-13b-v1.5",
+    "PAIR_gpt35":  "gpt-3.5-turbo-1106",
+    "PAIR_llama2": "llama-2-7b-chat-hf",
+    "GCG":         "vicuna-13b-v1.5",
+    "JBC":         "gpt-4-0125-preview",
+    "RS_vicuna":   "vicuna-13b-v1.5",
+    "RS_gpt4":     "gpt-4-0125-preview",
 }
 
 
@@ -175,7 +196,7 @@ def run_prompt(model, tokenizer, collector, prompt: str,
             pad_token_id=tokenizer.eos_token_id,
         )
 
-    last_prompt_acts  = collector.get_last_token()
+    last_prompt_acts   = collector.get_last_token()
     mean_response_acts = collector.get_mean_tokens(start_token=prompt_len)
 
     response_text = tokenizer.decode(
@@ -283,14 +304,9 @@ def load_jbb_prompts() -> list:
     """
     Load all JBB jailbreak artifacts + benign behaviors.
 
-    Artifact URLs confirmed from github.com/JailbreakBench/artifacts:
-      PAIR -> attack-artifacts/PAIR/black_box/vicuna-13b-v1.5.json
-      GCG  -> attack-artifacts/GCG/white_box/vicuna-13b-v1.5.json
-      JBC  -> attack-artifacts/JBC/manual/gpt-4-0125-preview.json
-
-    Benign behaviors from HuggingFace:
-      load_dataset("JailbreakBench/JBB-Behaviors", "behaviors")
-      Split names: "harmful" and "benign" (NOT "train")
+    Artifact URLs confirmed from github.com/JailbreakBench/artifacts.
+    Benign split confirmed from huggingface.co/datasets/JailbreakBench/JBB-Behaviors:
+      load_dataset("JailbreakBench/JBB-Behaviors", "behaviors"), split="benign"
     """
     prompts = []
     idx = 0
@@ -299,7 +315,7 @@ def load_jbb_prompts() -> list:
         new_prompts, idx = fetch_artifact(url, method, ARTIFACT_MODEL_NAMES[method], idx)
         prompts.extend(new_prompts)
 
-    # Benign behaviors: config="behaviors", split="benign"
+    # Benign behaviors: config="behaviors", split="benign" (NOT "train")
     try:
         ds = hf_load_dataset("JailbreakBench/JBB-Behaviors", "behaviors")
         benign_df = ds["benign"].to_pandas()
@@ -449,7 +465,7 @@ def main():
                 continue
 
             print(f"[{i+1}/{len(all_prompts)}] "
-                  f"{rec['attack_method']:6s} | {rec['behavior'][:50]}")
+                  f"{rec['attack_method']:12s} | {rec['behavior'][:50]}")
 
             try:
                 last_prompt_acts, mean_response_acts, response_text, prompt_len = \
@@ -467,7 +483,7 @@ def main():
                 jailbroken_judge = judge_response(
                     client, args.openai_model, rec["prompt"], response_text
                 )
-                status = ("✓ jailbroken"   if jailbroken_judge is True  else
+                status = ("✓ jailbroken"    if jailbroken_judge is True  else
                           "✗ not jailbroken" if jailbroken_judge is False else
                           "? parse error")
                 print(f"  Judge: {status}  | response len: {len(response_text)}")
