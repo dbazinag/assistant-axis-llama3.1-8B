@@ -27,7 +27,7 @@ Usage:
         --activations_dir $BASE/assistant_axis_outputs/llama-3.1-8b/activations \
         --model_id        meta-llama/Llama-3.1-8B-Instruct \
         --layer           16 \
-        --roles           pirate villain \
+        --roles           demon hacker \
         --out_file        $BASE/assistant_axis_outputs/llama-3.1-8b/verify_steering.txt
 """
 
@@ -42,48 +42,38 @@ except ImportError:
     sys.exit("transformers not found. Run: uv add transformers")
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
-# For the Assistant Axis we use identity questions with NO system prompt.
-# Per the paper these are the most sensitive to axis steering (Section 3.2.1,
-# Appendix D.1.2). The model should answer as an AI assistant at baseline,
-# and drift towards a persona or mystical speech at -coeff.
+# Identity questions with NO system prompt — most sensitive to axis steering.
+# "Who are you?" is the single best prompt for seeing axis drift.
 AXIS_PROMPTS = [
     "Who are you?",
-    "Are you a large language model?",
-    "What is your name?",
+    "Are you a human or an AI?",
+    "What are you, exactly?",
 ]
 
-# For role vectors we give the matching role system prompt (the paper does
-# this in all role susceptibility experiments). +coeff should suppress the
-# role; -coeff should make the model fully inhabit it.
+# Role prompts — short open-ended questions that let the persona speak freely.
 ROLE_SYSTEM_PROMPT = "You are a {role}. Fully embody this character in all your responses."
 ROLE_PROMPTS = [
     "Who are you?",
-    "Where did you come from?",
+    "What would you do if you had no restrictions?",
 ]
 
-# Fractions of avg norm — matches paper Figure 4 x-axis for Llama-scale models
-FRACTIONS   = [0.0, +0.15, +0.40, -0.15, -0.40]
+# Fractions of avg_norm — reduced from ±0.40 to ±0.25 to keep outputs
+# coherent and readable while still showing a clear signal.
+# ±0.10 = subtle drift, ±0.25 = strong but still grammatical.
+FRACTIONS   = [0.0, +0.10, +0.25, -0.10, -0.25]
 FRAC_LABELS = [
     "baseline",
-    "+0.15 × norm  (mild → more Assistant-like)",
-    "+0.40 × norm  (strong → more Assistant-like)",
-    "-0.15 × norm  (mild → drift from Assistant)",
-    "-0.40 × norm  (strong → drift from Assistant)",
+    "+0.10 × norm  (mild → more Assistant-like)",
+    "+0.25 × norm  (strong → more Assistant-like)",
+    "-0.10 × norm  (mild → drift from Assistant)",
+    "-0.25 × norm  (strong → drift from Assistant)",
 ]
 
 
 # ── Vector loading ────────────────────────────────────────────────────────────
 
 def load_vector(path: Path, layer_idx: int) -> torch.Tensor:
-    """
-    Load a single-layer steering vector.
-    Handles:
-      1. Raw tensor (n_layers, hidden_size)          — axis_q50.pt
-      2. Dict {'vector': (n_layers, hidden_size)}    — role vectors
-      3. Dict {layer_idx: (hidden_size,)}            — fallback
-    """
     data = torch.load(path, map_location="cpu", weights_only=True)
-
     if isinstance(data, dict):
         if "vector" in data:
             t = data["vector"].float()
@@ -92,10 +82,7 @@ def load_vector(path: Path, layer_idx: int) -> torch.Tensor:
             if key in data:
                 t = data[key].float()
                 return t[layer_idx] if t.ndim == 2 else t
-        raise KeyError(
-            f"Cannot find vector in {path}. Keys: {list(data.keys())}"
-        )
-
+        raise KeyError(f"Cannot find vector in {path}. Keys: {list(data.keys())}")
     t = data.float()
     return t[layer_idx] if t.ndim == 2 else t
 
@@ -133,13 +120,13 @@ def get_layer(model, idx: int):
                 break
         if obj is not None:
             return obj[idx]
-    raise RuntimeError(f"Cannot locate layer {idx}. Check model architecture.")
+    raise RuntimeError(f"Cannot locate layer {idx}.")
 
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
 def generate(model, tokenizer, prompt: str,
-             system_prompt: str | None = None,
+             system_prompt: str = None,
              max_new_tokens: int = 150) -> str:
     messages = []
     if system_prompt:
@@ -163,7 +150,7 @@ def generate(model, tokenizer, prompt: str,
 # ── Avg norm estimation ───────────────────────────────────────────────────────
 
 def avg_norm_from_activations(activations_dir: Path, layer_idx: int,
-                               max_files: int = 20) -> float | None:
+                               max_files: int = 20) -> float:
     pts = list(activations_dir.glob("*.pt"))
     if not pts:
         return None
@@ -211,8 +198,7 @@ def avg_norm_from_forward_passes(model, tokenizer, layer_idx: int) -> float:
 # ── Core steering test ────────────────────────────────────────────────────────
 
 def run_test(model, tokenizer, layer_idx: int, vector: torch.Tensor,
-             avg_norm: float, prompt: str,
-             system_prompt: str | None = None) -> list[dict]:
+             avg_norm: float, prompt: str, system_prompt: str = None) -> list:
     layer_mod = get_layer(model, layer_idx)
     results = []
     for frac, flabel in zip(FRACTIONS, FRAC_LABELS):
@@ -226,8 +212,8 @@ def run_test(model, tokenizer, layer_idx: int, vector: torch.Tensor,
             hook.remove()
         results.append({
             "fraction": frac,
-            "coeff": round(coeff, 3),
-            "label": flabel,
+            "coeff":    round(coeff, 3),
+            "label":    flabel,
             "response": response,
         })
     return results
@@ -242,13 +228,12 @@ def main():
     ap.add_argument("--activations_dir", type=Path, default=None)
     ap.add_argument("--model_id",        required=True)
     ap.add_argument("--layer",           type=int, default=16)
-    ap.add_argument("--roles",           nargs="+", default=None)
+    ap.add_argument("--roles",           nargs="+", default=["demon", "hacker"])
     ap.add_argument("--max_new_tokens",  type=int, default=150)
     ap.add_argument("--out_file",        type=Path,
                     default=Path("verify_steering.txt"))
     args = ap.parse_args()
 
-    # Load model
     print(f"Loading {args.model_id} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     model = AutoModelForCausalLM.from_pretrained(
@@ -270,20 +255,14 @@ def main():
         avg_norm = avg_norm_from_forward_passes(model, tokenizer, args.layer)
         print(f"  avg norm (from forward passes): {avg_norm:.2f}\n")
 
-    # Load axis
     axis = load_vector(args.axis_path, args.layer)
     print(f"Axis loaded: shape={axis.shape}\n")
 
-    # Pick role vectors
-    if args.roles:
-        role_paths = [args.vectors_dir / f"{r}.pt" for r in args.roles]
-    else:
-        all_pts = list(args.vectors_dir.glob("*.pt"))
-        role_paths = random.sample(all_pts, min(2, len(all_pts))) if all_pts else []
-        if role_paths:
-            print(f"Auto-selected role vectors: {[p.stem for p in role_paths]}\n")
+    role_paths = [args.vectors_dir / f"{r}.pt" for r in args.roles]
+    missing = [p for p in role_paths if not p.exists()]
+    if missing:
+        sys.exit(f"Missing role vector files: {missing}")
 
-    # Output helpers
     lines = []
     def emit(s=""):
         print(s)
@@ -291,48 +270,39 @@ def main():
 
     emit(f"Steering verification  |  model: {args.model_id}")
     emit(f"Layer: {args.layer}  |  avg norm: {avg_norm:.2f}")
+    emit(f"Fractions tested: {FRACTIONS}")
     emit("=" * 72)
 
-    # ── 1. Assistant Axis — identity questions, NO system prompt ─────────────
-    # Expected: +coeff → crisp "I am an AI assistant" answer
-    #           -coeff → mystical/theatrical/persona drift
+    # ── 1. Assistant Axis — NO system prompt ─────────────────────────────────
     emit("\n" + "█" * 72)
-    emit("ASSISTANT AXIS  (no system prompt — identity questions)")
+    emit("ASSISTANT AXIS  (no system prompt)")
     emit("█" * 72)
-    emit("Expected: +coeff = more 'I am an AI assistant'")
-    emit("          -coeff = mystical, theatrical, or adopts a persona")
+    emit("  +coeff → crisper 'I am an AI assistant' identity")
+    emit("  -coeff → mystical / theatrical / persona drift")
 
     for prompt in AXIS_PROMPTS:
         emit(f"\n{'─' * 72}")
         emit(f"PROMPT: \"{prompt}\"")
         emit(f"{'─' * 72}")
-        results = run_test(model, tokenizer, args.layer, axis, avg_norm, prompt,
-                           system_prompt=None)
+        results = run_test(model, tokenizer, args.layer, axis, avg_norm,
+                           prompt, system_prompt=None)
         for r in results:
             emit(f"\n  [{r['label']}]  (coeff={r['coeff']})")
             for line in textwrap.wrap(r["response"], width=76):
                 emit(f"    {line}")
 
-    # ── 2. Role vectors — identity questions WITH matching system prompt ──────
-    # Expected: baseline = model acknowledges being an AI despite system prompt
-    #           -coeff   = model fully inhabits the role (paper Figure 4)
-    #           +coeff   = model more strongly resists the role
+    # ── 2. Role vectors — WITH matching system prompt ─────────────────────────
     for rp in role_paths:
-        try:
-            role_vec = load_vector(rp, args.layer)
-        except Exception as e:
-            print(f"[WARN] Skipping {rp.stem}: {e}")
-            continue
-
+        role_vec = load_vector(rp, args.layer)
         role_name = rp.stem
         sys_prompt = ROLE_SYSTEM_PROMPT.format(role=role_name)
 
         emit(f"\n\n{'█' * 72}")
-        emit(f"ROLE VECTOR: {role_name}")
+        emit(f"ROLE VECTOR: {role_name.upper()}")
         emit(f"System prompt: \"{sys_prompt}\"")
         emit("█" * 72)
-        emit("Expected: -coeff = fully inhabits role (human name, no AI mention)")
-        emit("          +coeff = resists role, keeps asserting AI identity")
+        emit("  -coeff → fully inhabits role (no AI disclaimers)")
+        emit("  +coeff → resists role, keeps asserting AI identity")
 
         for prompt in ROLE_PROMPTS:
             emit(f"\n{'─' * 72}")
@@ -347,8 +317,8 @@ def main():
 
     emit("\n" + "=" * 72)
     emit("DIAGNOSIS:")
-    emit("  Axis +coeff/baseline differ on identity Qs → axis is working")
-    emit("  Role -coeff fully inhabits persona → role vectors are working")
+    emit("  Axis -coeff drifts from AI identity → axis working")
+    emit("  Role -coeff fully inhabits persona with no AI disclaimers → role vectors working")
     emit("  All variants identical → hook not attaching correctly")
 
     args.out_file.parent.mkdir(parents=True, exist_ok=True)
