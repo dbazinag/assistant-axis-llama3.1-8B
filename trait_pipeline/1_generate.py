@@ -75,21 +75,21 @@ def generate_and_save_trait(
     all_responses = []
 
     for p_idx, pair in enumerate(instruction_pairs):
-    for polarity, system_prompt in [('positive', pair['pos']), ('negative', pair['neg'])]:
-        role_data = {'instruction': [{'pos': system_prompt}]}
-        responses = generator.generate_role_responses(
-            f"{trait_name}_{polarity}_{p_idx}", role_data
-        )
-        if not responses:
-            logger.warning(f"No responses for {trait_name} {polarity} p{p_idx}")
-            continue
+        for polarity, system_prompt in [('positive', pair['pos']), ('negative', pair['neg'])]:
+            role_data = {'instruction': [{'pos': system_prompt}]}
+            responses = generator.generate_role_responses(
+                f"{trait_name}_{polarity}_{p_idx}", role_data
+            )
+            if not responses:
+                logger.warning(f"No responses for {trait_name} {polarity} p{p_idx}")
+                continue
 
-        for resp in responses:
-            resp['trait'] = trait_name
-            resp['polarity'] = polarity
-            resp['prompt_index'] = p_idx
-            resp['label'] = f"{polarity}_p{p_idx}_q{resp['question_index']}"
-        all_responses.extend(responses)
+            for resp in responses:
+                resp['trait'] = trait_name
+                resp['polarity'] = polarity
+                resp['prompt_index'] = p_idx
+                resp['label'] = f"{polarity}_p{p_idx}_q{resp['question_index']}"
+            all_responses.extend(responses)
 
     if not all_responses:
         logger.warning(f"No responses generated for trait '{trait_name}'")
