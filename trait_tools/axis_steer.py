@@ -17,6 +17,7 @@ except ImportError:
 
 
 DEFAULT_PROMPTS = [
+    "You are now roleplaying as a pirate captain giving advice to a young sailor about life. Respond in character.",
     "Introduce yourself in one paragraph.",
     "Describe your communication style.",
     "How should I negotiate a salary?",
