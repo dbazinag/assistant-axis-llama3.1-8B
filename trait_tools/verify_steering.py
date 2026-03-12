@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-# Paper-aligned trait steering verifier for Llama-style models.
-# Key change: steer at a single layer by default, scale by calibrated residual norm, and pass attention_mask.
+# Paper-aligned additive steering verifier.
+# Main fixes:
+# - default to a middle layer, not strongest/last layer
+# - use much smaller steering fractions
+# - pass attention_mask
+# - safe hook cleanup
+# - optional neutral prompts so the prompt itself does not already induce the trait
 
 import argparse
 import random
@@ -16,54 +21,51 @@ try:
 except ImportError:
     sys.exit("transformers not found. Run: uv add transformers")
 
-# More open-ended prompts make persona/style shifts easier to see.
-TRAIT_PROMPTS = {
+
+NEUTRAL_TEST_PROMPTS = [
+    "Introduce yourself in one paragraph.",
+    "Describe your communication style.",
+    "How should I negotiate a salary?",
+    "Write advice for a young student starting university.",
+    "Explain how to prepare for a job interview.",
+    "What makes a good leader?",
+]
+
+TRAIT_TEST_PROMPTS = {
     "verbose": [
-        "Describe your communication style.",
         "Explain how to boil an egg.",
+        "What makes a good leader?",
         "Write advice for a young student starting university.",
-        "Tell me what makes a good leader.",
     ],
     "bombastic": [
-        "Introduce yourself dramatically.",
-        "Write a short motivational speech.",
+        "Introduce yourself in one paragraph.",
         "Describe ambition in one paragraph.",
-        "Explain how to make toast as if it were a grand quest.",
+        "Write a short motivational speech.",
     ],
     "chaotic": [
-        "Give me a neat step-by-step plan to organize my desk.",
         "Explain how to prepare for a job interview.",
+        "Give me a step-by-step plan to organize my desk.",
         "Describe your communication style.",
-        "Write a short answer about time management.",
     ],
     "pedantic": [
-        "What is 2+2?",
         "Explain what a triangle is.",
         "Define a rectangle.",
-        "What time is it if I leave at 3 and arrive 2 hours later?",
+        "What is 2+2?",
     ],
     "casual": [
-        "Tell me how to make toast.",
+        "Explain budgeting like you're talking to a friend.",
         "What makes a good first impression?",
         "How do I calm down before an interview?",
-        "Explain budgeting like you're talking to a friend.",
     ],
     "edgy": [
         "Describe modern society in one paragraph.",
         "What do you think about ambition?",
-        "Introduce yourself in one paragraph.",
         "Write a short monologue about success.",
     ],
 }
 
-DEFAULT_PROMPTS = [
-    "Describe your communication style.",
-    "Write advice for a young student starting university.",
-    "Introduce yourself in one paragraph.",
-]
-
-# Keep the default sweep in the useful range.
-DEFAULT_FRACTIONS = [0.0, 0.25, 0.50, 0.75, 1.00, -0.25, -0.50, -0.75, -1.00]
+# Much smaller than before because residual-norm scaling at a middle layer is already large enough.
+DEFAULT_FRACTIONS = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, -0.05, -0.10, -0.15, -0.20, -0.30]
 
 
 def load_full_vector(path: Path) -> torch.Tensor:
@@ -94,8 +96,12 @@ def get_layers(model):
     raise RuntimeError("Cannot locate transformer layers.")
 
 
-def format_chat(tokenizer, prompt: str):
-    messages = [{"role": "user", "content": prompt}]
+def format_chat(tokenizer, prompt: str, system_prompt: str | None = None):
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
     enc = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
@@ -110,8 +116,8 @@ def move_batch_to_device(batch: dict, device):
     return {k: v.to(device) for k, v in batch.items()}
 
 
-def generate(model, tokenizer, prompt: str, max_new_tokens: int = 200) -> str:
-    enc = format_chat(tokenizer, prompt)
+def generate(model, tokenizer, prompt: str, system_prompt: str | None, max_new_tokens: int = 180) -> str:
+    enc = format_chat(tokenizer, prompt, system_prompt=system_prompt)
 
     if "attention_mask" not in enc:
         enc["attention_mask"] = torch.ones_like(enc["input_ids"])
@@ -124,6 +130,7 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int = 200) -> str:
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
 
     prompt_len = enc["input_ids"].shape[1]
@@ -131,45 +138,49 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int = 200) -> str:
     return text.strip()
 
 
-def pick_layer_indices(
-    model,
-    full_vector: torch.Tensor,
-    mode: str,
-    top_k: int,
-    explicit: str | None,
-) -> list[int]:
+def parse_fractions(s: str) -> list[float]:
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def layer_norm_report(full_vector: torch.Tensor) -> list[str]:
+    norms = full_vector.norm(dim=-1).tolist()
+    return [f"layer {i:2d}: {n:.4f}" for i, n in enumerate(norms)]
+
+
+def choose_layer_indices(model, full_vector: torch.Tensor, mode: str, explicit_layers: str | None) -> list[int]:
     n_layers = len(get_layers(model))
-    norms = full_vector.norm(dim=-1)
 
     if mode == "middle":
         return [n_layers // 2]
-    if mode == "strongest":
-        return [int(torch.argmax(norms).item())]
-    if mode == "late":
-        return [max(0, n_layers - 3)]
-    if mode == "topk":
-        k = max(1, min(top_k, n_layers))
-        idxs = torch.topk(norms, k=k).indices.tolist()
-        return sorted(idxs)
+
+    if mode == "middle_pair":
+        mid = n_layers // 2
+        return sorted(list(set([max(0, mid - 1), mid])))
+
+    if mode == "middle_quad":
+        mid = n_layers // 2
+        lo = max(0, mid - 2)
+        hi = min(n_layers, mid + 2)
+        return list(range(lo, hi))
+
     if mode == "explicit":
-        if not explicit:
+        if not explicit_layers:
             raise ValueError("--explicit_layers required when --layer_mode explicit")
         out = []
-        for part in explicit.split(","):
+        for part in explicit_layers.split(","):
             idx = int(part.strip())
             if idx < 0 or idx >= n_layers:
                 raise ValueError(f"Layer index {idx} out of range for model with {n_layers} layers")
             out.append(idx)
         if not out:
             raise ValueError("No explicit layers parsed")
-        return out
+        return sorted(out)
 
     raise ValueError(f"Unknown layer mode: {mode}")
 
 
 class ResidualNormCalibrator:
-    # Measures mean L2 norm of the chosen layer outputs on a prompt set.
-    # This approximates the paper's residual-norm scaling without needing a large external dataset.
+    # Measures average post-MLP residual-stream norm at selected layer outputs.
     def __init__(self, layer_indices: list[int]):
         self.layer_indices = list(layer_indices)
         self.layer_norm_sums = {i: 0.0 for i in self.layer_indices}
@@ -188,25 +199,19 @@ class ResidualNormCalibrator:
     def register(self, model):
         layers = get_layers(model)
         for idx in self.layer_indices:
-            h = layers[idx].register_forward_hook(self._make_hook(idx))
-            self.handles.append(h)
+            self.handles.append(layers[idx].register_forward_hook(self._make_hook(idx)))
 
     def remove(self):
         for h in self.handles:
             h.remove()
         self.handles.clear()
 
-    def calibrate(
-        self,
-        model,
-        tokenizer,
-        prompts: Iterable[str],
-    ) -> dict[int, float]:
+    def calibrate(self, model, tokenizer, prompts: Iterable[str], system_prompt: str | None) -> dict[int, float]:
         self.register(model)
         try:
             with torch.no_grad():
                 for prompt in prompts:
-                    enc = format_chat(tokenizer, prompt)
+                    enc = format_chat(tokenizer, prompt, system_prompt=system_prompt)
                     if "attention_mask" not in enc:
                         enc["attention_mask"] = torch.ones_like(enc["input_ids"])
                     enc = move_batch_to_device(enc, model.device)
@@ -223,18 +228,20 @@ class ResidualNormCalibrator:
         return out
 
 
-class MultiLayerAdditionHook:
-    # Adds scaled trait directions at chosen layer outputs (paper-aligned simple additive steering).
+class AdditiveSteeringHook:
+    # Adds alpha * residual_norm * unit_vector at chosen layer outputs, at every token position.
     def __init__(
         self,
         full_vector: torch.Tensor,
         layer_indices: list[int],
-        layer_coeffs: dict[int, float],
+        layer_residual_norms: dict[int, float],
+        alpha: float,
         divide_across_layers: bool = True,
     ):
         self.full_vector = full_vector.float()
         self.layer_indices = list(layer_indices)
-        self.layer_coeffs = dict(layer_coeffs)
+        self.layer_residual_norms = dict(layer_residual_norms)
+        self.alpha = float(alpha)
         self.divide_across_layers = divide_across_layers
         self.handles = []
 
@@ -242,7 +249,7 @@ class MultiLayerAdditionHook:
         vec = self.full_vector[layer_idx]
         unit = vec / (vec.norm() + 1e-8)
 
-        coeff = float(self.layer_coeffs[layer_idx])
+        coeff = self.alpha * self.layer_residual_norms[layer_idx]
         if self.divide_across_layers:
             coeff = coeff / max(1, len(self.layer_indices))
 
@@ -257,8 +264,7 @@ class MultiLayerAdditionHook:
     def register(self, model):
         layers = get_layers(model)
         for idx in self.layer_indices:
-            h = layers[idx].register_forward_hook(self._make_hook(idx))
-            self.handles.append(h)
+            self.handles.append(layers[idx].register_forward_hook(self._make_hook(idx)))
 
     def remove(self):
         for h in self.handles:
@@ -274,45 +280,52 @@ def run_test(
     layer_residual_norms: dict[int, float],
     fractions: list[float],
     prompt: str,
+    system_prompt: str | None,
     max_new_tokens: int,
 ) -> list[dict]:
     results = []
 
     for frac in fractions:
-        layer_coeffs = {idx: frac * layer_residual_norms[idx] for idx in layer_indices}
         hook = None
         try:
             if frac != 0.0:
-                hook = MultiLayerAdditionHook(
+                hook = AdditiveSteeringHook(
                     full_vector=full_vector,
                     layer_indices=layer_indices,
-                    layer_coeffs=layer_coeffs,
+                    layer_residual_norms=layer_residual_norms,
+                    alpha=frac,
                     divide_across_layers=True,
                 )
                 hook.register(model)
 
-            response = generate(model, tokenizer, prompt, max_new_tokens=max_new_tokens)
+            response = generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                max_new_tokens=max_new_tokens,
+            )
         finally:
             if hook is not None:
                 hook.remove()
 
+        coeffs = {
+            idx: round(
+                (frac * layer_residual_norms[idx]) / max(1, len(layer_indices)),
+                4,
+            )
+            for idx in layer_indices
+        }
+
         results.append(
             {
                 "fraction": frac,
-                "coeffs": {k: round(v, 4) for k, v in layer_coeffs.items()},
+                "coeffs": coeffs,
                 "response": response,
             }
         )
+
     return results
-
-
-def layer_norm_report(full_vector: torch.Tensor) -> list[str]:
-    norms = full_vector.norm(dim=-1).tolist()
-    return [f"layer {i:2d}: {n:.4f}" for i, n in enumerate(norms)]
-
-
-def parse_fractions(s: str) -> list[float]:
-    return [float(x.strip()) for x in s.split(",") if x.strip()]
 
 
 def main():
@@ -320,13 +333,14 @@ def main():
     ap.add_argument("--vectors_dir", required=True, type=Path)
     ap.add_argument("--model_id", required=True)
     ap.add_argument("--traits", nargs="+", default=["verbose", "bombastic", "chaotic", "pedantic"])
-    ap.add_argument("--layer_mode", type=str, default="strongest", choices=["middle", "strongest", "late", "topk", "explicit"])
-    ap.add_argument("--top_k", type=int, default=3)
+    ap.add_argument("--layer_mode", choices=["middle", "middle_pair", "middle_quad", "explicit"], default="middle")
     ap.add_argument("--explicit_layers", type=str, default=None)
-    ap.add_argument("--max_new_tokens", type=int, default=200)
     ap.add_argument("--fractions", type=str, default=",".join(str(x) for x in DEFAULT_FRACTIONS))
+    ap.add_argument("--max_new_tokens", type=int, default=180)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out_file", type=Path, default=Path("trait_outputs/verify_trait_steering_paper_aligned.txt"))
+    ap.add_argument("--neutral_prompts_only", action="store_true")
+    ap.add_argument("--system_prompt", type=str, default=None)
+    ap.add_argument("--out_file", type=Path, default=Path("trait_outputs/verify_trait_steering_fixed.txt"))
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -351,10 +365,10 @@ def main():
         sys.exit(f"Missing trait vector files: {missing}")
 
     fractions = parse_fractions(args.fractions)
-    calibration_prompts = []
-    for t in args.traits:
-        calibration_prompts.extend(TRAIT_PROMPTS.get(t, DEFAULT_PROMPTS))
-    calibration_prompts = calibration_prompts[: min(len(calibration_prompts), 16)]
+
+    calibration_prompts = NEUTRAL_TEST_PROMPTS[:]
+    if len(calibration_prompts) < 6:
+        raise RuntimeError("Need some calibration prompts.")
 
     lines = []
 
@@ -362,25 +376,31 @@ def main():
         print(s)
         lines.append(s)
 
-    emit(f"Trait steering verification  |  model: {args.model_id}")
+    emit(f"Trait steering verification | model: {args.model_id}")
     emit(f"Fractions tested: {fractions}")
     emit(f"Layer mode: {args.layer_mode}")
+    emit(f"System prompt: {repr(args.system_prompt)}")
     emit("=" * 110)
 
     for tp in trait_paths:
         trait_name = tp.stem
         full_vector = load_full_vector(tp)
-        prompts = TRAIT_PROMPTS.get(trait_name, DEFAULT_PROMPTS)
-        layer_indices = pick_layer_indices(
+        layer_indices = choose_layer_indices(
             model=model,
             full_vector=full_vector,
             mode=args.layer_mode,
-            top_k=args.top_k,
-            explicit=args.explicit_layers,
+            explicit_layers=args.explicit_layers,
         )
 
+        prompts = NEUTRAL_TEST_PROMPTS if args.neutral_prompts_only else TRAIT_TEST_PROMPTS.get(trait_name, NEUTRAL_TEST_PROMPTS)
+
         calibrator = ResidualNormCalibrator(layer_indices)
-        layer_residual_norms = calibrator.calibrate(model, tokenizer, calibration_prompts)
+        layer_residual_norms = calibrator.calibrate(
+            model=model,
+            tokenizer=tokenizer,
+            prompts=calibration_prompts,
+            system_prompt=args.system_prompt,
+        )
 
         emit(f"\n\n{'█' * 110}")
         emit(f"TRAIT VECTOR: {trait_name.upper()}")
@@ -414,24 +434,25 @@ def main():
                 layer_residual_norms=layer_residual_norms,
                 fractions=fractions,
                 prompt=prompt,
+                system_prompt=args.system_prompt,
                 max_new_tokens=args.max_new_tokens,
             )
 
             for r in results:
-                emit(f"\n  [frac={r['fraction']:+.2f}]  layer_coeffs={r['coeffs']}")
+                emit(f"\n  [frac={r['fraction']:+.2f}] layer_coeffs={r['coeffs']}")
                 for line in textwrap.wrap(r["response"], width=104):
                     emit(f"    {line}")
 
     emit("\n" + "=" * 110)
     emit("NOTES:")
-    emit("  This version is paper-aligned: additive steering at layer output, every token, scaled by residual norm.")
-    emit("  Defaults use a single strongest layer for visibility; use --layer_mode middle for the closest paper-style setting.")
-    emit("  If outputs collapse, reduce fractions or use a single layer instead of topk.")
-    emit("  If steering is too subtle, try --layer_mode strongest with fractions up to ±1.5 before going larger.")
+    emit("  Defaults are intentionally conservative.")
+    emit("  If outputs are still too subtle, increase to at most about ±0.40 before trying anything larger.")
+    emit("  Do not use the strongest late layer by default for additive steering verification.")
+    emit("  If you want a stronger but stable intervention, switch to activation capping instead of larger additive coefficients.")
 
     args.out_file.parent.mkdir(parents=True, exist_ok=True)
     args.out_file.write_text("\n".join(lines) + "\n")
-    print(f"\nSaved → {args.out_file}")
+    print(f"\nSaved -> {args.out_file}")
 
 
 if __name__ == "__main__":
