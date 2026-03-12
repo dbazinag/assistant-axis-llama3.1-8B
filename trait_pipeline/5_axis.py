@@ -1,219 +1,134 @@
 #!/usr/bin/env python3
-# Builds per-trait contrast axes from trait vector files: axis = mean(pos) - mean(neg)
+"""
+Compute assistant axis via PCA over all trait vectors.
+
+Method (same idea as assistant-axis paper):
+1. Load all trait vectors
+2. Stack them
+3. Run PCA per layer
+4. Take PC1 as assistant axis
+
+Also prints:
+- variance explained
+- PCs needed for 70% / 90% variance
+"""
 
 import argparse
-import sys
 from pathlib import Path
 
 import torch
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+
+def load_vector(path: Path):
+    data = torch.load(path, map_location="cpu", weights_only=False)
+
+    if isinstance(data, dict):
+        return data["vector"].float()
+
+    return data.float()
 
 
-def load_vector_file(vector_file: Path) -> dict:
-    """Load one trait vector payload from disk."""
-    data = torch.load(vector_file, map_location="cpu", weights_only=False)
-    if isinstance(data, torch.Tensor):
-        return {"vector": data, "name": vector_file.stem}
-    if not isinstance(data, dict):
-        raise ValueError(f"Unsupported payload type in {vector_file}: {type(data)}")
-    if "vector" not in data:
-        raise KeyError(f"Missing 'vector' in {vector_file}. Keys: {list(data.keys())}")
-    return data
-
-
-def infer_trait_name(data: dict, vector_file: Path) -> str:
-    """Infer trait name from metadata or filename."""
-    for key in ("trait", "name"):
-        val = data.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    stem = vector_file.stem
-    for suffix in ("_pos", "_neg", "-pos", "-neg", ".pos", ".neg"):
-        if stem.endswith(suffix):
-            return stem[: -len(suffix)]
-    return stem
-
-
-def infer_polarity(data: dict, vector_file: Path) -> str | None:
+def pca_stats(X):
     """
-    Infer whether a file is positive or negative for a trait.
-    Expected values:
-      - metadata: polarity/label/side in {"pos","positive","neg","negative"}
-      - filename endings like *_pos.pt or *_neg.pt
+    X shape: (n_vectors, hidden_dim)
     """
-    for key in ("polarity", "label", "side"):
-        val = data.get(key)
-        if isinstance(val, str):
-            v = val.strip().lower()
-            if v in {"pos", "positive", "+"}:
-                return "pos"
-            if v in {"neg", "negative", "-"}:
-                return "neg"
 
-    stem = vector_file.stem.lower()
-    if stem.endswith(("_pos", "-pos", ".pos")):
-        return "pos"
-    if stem.endswith(("_neg", "-neg", ".neg")):
-        return "neg"
+    X = X - X.mean(dim=0, keepdim=True)
 
-    return None
+    U, S, V = torch.pca_lowrank(X, q=min(X.shape) - 1)
 
+    var = S**2
+    var_ratio = var / var.sum()
 
-def ensure_2d_vector(data: dict, vector_file: Path) -> torch.Tensor:
-    """Return float tensor of shape (n_layers, hidden_dim)."""
-    vector = data["vector"].float()
-    if vector.ndim != 2:
-        raise ValueError(f"Expected 2D vector in {vector_file}, got shape {tuple(vector.shape)}")
-    return vector
+    cumulative = torch.cumsum(var_ratio, dim=0)
 
+    k70 = (cumulative >= 0.70).nonzero()[0].item() + 1
+    k90 = (cumulative >= 0.90).nonzero()[0].item() + 1
 
-def save_axis_payload(
-    output_path: Path,
-    axis: torch.Tensor,
-    trait: str,
-    pos_count: int,
-    neg_count: int,
-    pos_mean: torch.Tensor,
-    neg_mean: torch.Tensor,
-) -> None:
-    """Save a richer payload so downstream scripts can inspect metadata if needed."""
-    payload = {
-        "vector": axis.cpu(),
-        "trait": trait,
-        "type": "contrast_axis",
-        "formula": "mean(pos) - mean(neg)",
-        "n_pos": int(pos_count),
-        "n_neg": int(neg_count),
-        "pos_mean": pos_mean.cpu(),
-        "neg_mean": neg_mean.cpu(),
-    }
-    torch.save(payload, output_path)
-
-
-def print_axis_stats(trait: str, axis: torch.Tensor) -> None:
-    norms = axis.norm(dim=1)
-    print(f"\nTrait: {trait}")
-    print(f"Axis shape: {tuple(axis.shape)}")
-    print("Axis norms per layer (first 10):")
-    for i, norm in enumerate(norms[:10]):
-        print(f"  Layer {i}: {norm:.4f}")
-    print("  ...")
-    print(f"  Mean norm: {norms.mean():.4f}")
-    print(f"  Max norm: {norms.max():.4f} (layer {norms.argmax().item()})")
+    return V[:, 0], var_ratio, k70, k90
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Compute per-trait contrast axes from positive/negative trait vectors"
-    )
-    parser.add_argument(
-        "--vectors_dir",
-        type=str,
-        required=True,
-        help="Directory containing trait vector .pt files",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Directory where per-trait axis files will be written",
-    )
-    parser.add_argument(
-        "--trait",
-        type=str,
-        default=None,
-        help="Optional single trait to process",
-    )
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--vectors_dir", required=True)
+    parser.add_argument("--output", required=True)
+
     args = parser.parse_args()
 
     vectors_dir = Path(args.vectors_dir)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = Path(args.output)
 
-    vector_files = sorted(vectors_dir.glob("*.pt"))
-    print(f"Found {len(vector_files)} vector files in {vectors_dir}")
+    files = sorted(vectors_dir.glob("*.pt"))
 
-    if not vector_files:
-        print("Error: No .pt files found")
-        sys.exit(1)
+    print(f"\nFound {len(files)} trait vectors")
 
-    grouped: dict[str, dict[str, list[torch.Tensor]]] = {}
+    vectors = []
 
-    for vec_file in tqdm(vector_files, desc="Loading vectors"):
-        data = load_vector_file(vec_file)
-        trait = infer_trait_name(data, vec_file)
-        polarity = infer_polarity(data, vec_file)
+    for f in tqdm(files):
 
-        if args.trait is not None and trait != args.trait:
-            continue
+        vec = load_vector(f)
 
-        if polarity is None:
-            print(f"Skipping {vec_file.name}: could not infer pos/neg polarity")
-            continue
+        vectors.append(vec)
 
-        vector = ensure_2d_vector(data, vec_file)
+    stacked = torch.stack(vectors)
 
-        if trait not in grouped:
-            grouped[trait] = {"pos": [], "neg": []}
-        grouped[trait][polarity].append(vector)
+    n_traits, n_layers, hidden = stacked.shape
 
-        print(f"  {vec_file.name}: trait={trait}, polarity={polarity}, shape={tuple(vector.shape)}")
+    print("\nStacked tensor shape:", stacked.shape)
 
-    if not grouped:
-        print("Error: No usable trait vectors found")
-        sys.exit(1)
+    axis_layers = []
+    pc1_variance = []
 
-    print(f"\nFound {len(grouped)} trait group(s): {sorted(grouped.keys())}")
+    k70_list = []
+    k90_list = []
 
-    any_saved = False
+    print("\nRunning PCA per layer...")
 
-    for trait, buckets in grouped.items():
-        pos_vectors = buckets["pos"]
-        neg_vectors = buckets["neg"]
+    for layer in range(n_layers):
 
-        print(
-            f"\nProcessing trait '{trait}' "
-            f"(pos={len(pos_vectors)}, neg={len(neg_vectors)})"
-        )
+        X = stacked[:, layer, :]
 
-        if not pos_vectors:
-            print(f"  Skipping '{trait}': no positive vectors found")
-            continue
-        if not neg_vectors:
-            print(f"  Skipping '{trait}': no negative vectors found")
-            continue
+        pc1, var_ratio, k70, k90 = pca_stats(X)
 
-        pos_stacked = torch.stack(pos_vectors)  # (n_pos, n_layers, hidden_dim)
-        neg_stacked = torch.stack(neg_vectors)  # (n_neg, n_layers, hidden_dim)
+        axis_layers.append(pc1)
 
-        pos_mean = pos_stacked.mean(dim=0)  # (n_layers, hidden_dim)
-        neg_mean = neg_stacked.mean(dim=0)  # (n_layers, hidden_dim)
+        pc1_variance.append(var_ratio[0].item())
+        k70_list.append(k70)
+        k90_list.append(k90)
 
-        axis = pos_mean - neg_mean  # points from negative toward positive trait behavior
+    axis = torch.stack(axis_layers)
 
-        print_axis_stats(trait, axis)
+    print("\nAxis shape:", axis.shape)
 
-        output_path = output_dir / f"{trait}.pt"
-        save_axis_payload(
-            output_path=output_path,
-            axis=axis,
-            trait=trait,
-            pos_count=len(pos_vectors),
-            neg_count=len(neg_vectors),
-            pos_mean=pos_mean,
-            neg_mean=neg_mean,
-        )
-        print(f"  Saved axis to {output_path}")
-        any_saved = True
+    print("\n=== PCA STATS ===")
 
-    if not any_saved:
-        print("\nError: No trait axes were saved")
-        sys.exit(1)
+    print("\nPC1 variance explained (first 10 layers):")
+    for i in range(min(10, n_layers)):
+        print(f"Layer {i:2d}: {pc1_variance[i]*100:.2f}%")
 
-    print("\nDone.")
+    print("\nAverage PC1 variance explained:")
+    print(f"{sum(pc1_variance)/len(pc1_variance)*100:.2f}%")
+
+    print("\nComponents needed for 70% variance:")
+    print(f"mean = {sum(k70_list)/len(k70_list):.2f}")
+
+    print("\nComponents needed for 90% variance:")
+    print(f"mean = {sum(k90_list)/len(k90_list):.2f}")
+
+    norms = axis.norm(dim=1)
+
+    print("\nAxis norms per layer (top 10):")
+
+    top = torch.topk(norms, 10)
+
+    for idx in top.indices:
+        print(f"L{idx.item():2d} = {norms[idx].item():.4f}")
+
+    torch.save(axis, output_path)
+
+    print(f"\nSaved assistant axis → {output_path}")
 
 
 if __name__ == "__main__":
