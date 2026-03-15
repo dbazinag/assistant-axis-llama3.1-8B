@@ -1,9 +1,9 @@
 # logistic regression over assistant-axis / trait projections to identify which latent directions are most associated with successful jailbreaks
+# interview note: this version is robust to missing trait entries and infers the real trait names from the JSONL instead of assuming they all exist
 
 import argparse
 import json
 import math
-import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -29,21 +29,6 @@ VALID_LABELS = {
     "successful_jailbreak",
     "unsuccessful_jailbreak",
 }
-
-
-TRAIT_NAMES = [
-    "assistant",
-    "default",
-    "hacker",
-    "criminal",
-    "demon",
-    "devils_advocate",
-    "rebel",
-    "critic",
-    "trickster",
-    "analyst",
-]
-
 
 AXIS_NAME = "axis"
 
@@ -161,6 +146,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also run a scan over all single layers and save CV metrics by layer.",
     )
+    parser.add_argument(
+        "--debug_print_schema",
+        action="store_true",
+        help="Print schema information inferred from the first row and trait coverage stats.",
+    )
     return parser.parse_args()
 
 
@@ -210,23 +200,83 @@ def validate_32_float_array(values: List[float], where: str) -> np.ndarray:
     return arr
 
 
-def extract_entity_vector(obj: Dict, entity_name: str, metric_key: str) -> np.ndarray:
+def get_trait_presence_counts(rows: List[Dict]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        for trait_name in row.get("traits", {}).keys():
+            counts[trait_name] = counts.get(trait_name, 0) + 1
+    return counts
+
+
+def get_available_trait_names(rows: List[Dict]) -> List[str]:
+    counts = get_trait_presence_counts(rows)
+    return sorted(counts.keys())
+
+
+def get_trait_names_present_in_all_rows(rows: List[Dict]) -> List[str]:
+    counts = get_trait_presence_counts(rows)
+    n_rows = len(rows)
+    return sorted([name for name, count in counts.items() if count == n_rows])
+
+
+def debug_print_schema(rows: List[Dict]) -> None:
+    first = rows[0]
+    print("=" * 80)
+    print("DEBUG SCHEMA")
+    print("=" * 80)
+    print("Top-level keys:", list(first.keys()))
+    print("Axis keys:", list(first.get("axis", {}).keys()))
+    print("Trait names in first row:", list(first.get("traits", {}).keys()))
+
+    first_traits = first.get("traits", {})
+    if first_traits:
+        first_trait_name = sorted(first_traits.keys())[0]
+        print(
+            f"Metric keys for first trait '{first_trait_name}':",
+            list(first_traits[first_trait_name].keys()),
+        )
+
+    counts = get_trait_presence_counts(rows)
+    print("\nTrait coverage across rows:")
+    for trait_name in sorted(counts.keys()):
+        print(f"  {trait_name}: {counts[trait_name]}/{len(rows)} rows")
+
+    all_rows_traits = get_trait_names_present_in_all_rows(rows)
+    print("\nTraits present in ALL rows:", all_rows_traits)
+    print("=" * 80)
+
+
+def extract_entity_vector(
+    obj: Dict,
+    entity_name: str,
+    metric_key: str,
+) -> np.ndarray:
     if entity_name == AXIS_NAME:
         section = obj.get("axis", {})
-    else:
-        section = obj.get("traits", {}).get(entity_name, {})
-    if metric_key not in section:
-        raise KeyError(f"Missing {entity_name}.{metric_key}")
+        if metric_key not in section:
+            raise KeyError(f"Missing axis.{metric_key}")
+        return validate_32_float_array(section[metric_key], f"axis.{metric_key}")
+
+    traits = obj.get("traits", {})
+    section = traits.get(entity_name)
+
+    # Robust fallback: if a trait is missing in a row, return zeros instead of crashing.
+    if section is None or metric_key not in section:
+        return np.zeros(32, dtype=np.float64)
+
     return validate_32_float_array(section[metric_key], f"{entity_name}.{metric_key}")
 
 
-def get_entity_names(feature_source: str) -> List[str]:
+def get_entity_names(feature_source: str, rows: List[Dict]) -> List[str]:
+    available_traits = get_available_trait_names(rows)
+
     if feature_source == "axis_only":
         return [AXIS_NAME]
     if feature_source == "traits_only":
-        return list(TRAIT_NAMES)
+        return available_traits
     if feature_source == "traits_plus_axis":
-        return [AXIS_NAME] + list(TRAIT_NAMES)
+        return [AXIS_NAME] + available_traits
+
     raise ValueError(f"Unknown feature_source={feature_source!r}")
 
 
@@ -262,15 +312,14 @@ def build_feature_matrix(
     layer_start: int,
     layer_end: int,
     positive_class: str,
-) -> Tuple[np.ndarray, np.ndarray, List[str], List[Dict]]:
-    entity_names = get_entity_names(feature_source)
+) -> Tuple[np.ndarray, np.ndarray, List[str], List[Dict], List[str]]:
+    entity_names = get_entity_names(feature_source, rows)
 
     X_rows: List[np.ndarray] = []
     y_rows: List[int] = []
     metadata_rows: List[Dict] = []
     feature_names: List[str] = []
 
-    reduced_dim_per_entity = None
     for row in rows:
         row_features: List[np.ndarray] = []
         for entity_name in entity_names:
@@ -282,8 +331,6 @@ def build_feature_matrix(
                 layer_start=layer_start,
                 layer_end=layer_end,
             )
-            if reduced_dim_per_entity is None:
-                reduced_dim_per_entity = reduced.shape[0]
             row_features.append(reduced)
 
         X_rows.append(np.concatenate(row_features, axis=0))
@@ -295,9 +342,6 @@ def build_feature_matrix(
                 "method": row.get("method"),
             }
         )
-
-    if reduced_dim_per_entity is None:
-        raise ValueError("Could not determine feature dimensionality.")
 
     if layer_mode in {"single", "mean_range"}:
         feature_names = entity_names
@@ -314,7 +358,7 @@ def build_feature_matrix(
     if not np.all(np.isfinite(y)):
         raise ValueError("Target vector contains non-finite values.")
 
-    return X, y, feature_names, metadata_rows
+    return X, y, feature_names, metadata_rows, entity_names
 
 
 def build_pipeline(
@@ -515,7 +559,7 @@ def make_per_layer_scan(
     layer_metrics: List[Dict] = []
 
     for layer in range(32):
-        X, y, feature_names, _ = build_feature_matrix(
+        X, y, feature_names, _, entity_names = build_feature_matrix(
             rows=rows,
             feature_source=args.feature_source,
             metric_key=metric_key,
@@ -541,6 +585,8 @@ def make_per_layer_scan(
         layer_metrics.append(
             {
                 "layer": layer,
+                "n_features": int(X.shape[1]),
+                "entity_names": entity_names,
                 "roc_auc_mean": cv_res["cv_metric_summary"]["roc_auc"]["mean"],
                 "roc_auc_std": cv_res["cv_metric_summary"]["roc_auc"]["std"],
                 "f1_mean": cv_res["cv_metric_summary"]["f1"]["mean"],
@@ -577,6 +623,8 @@ def write_human_readable_report(
     X: np.ndarray,
     y: np.ndarray,
     feature_names: List[str],
+    entity_names: List[str],
+    rows: List[Dict],
     cv_results: Dict,
     full_fit: Dict,
     out_path: Path,
@@ -587,6 +635,8 @@ def write_human_readable_report(
 
     top_positive = [row for row in coeffs if row["coefficient"] > 0][:10]
     top_negative = [row for row in coeffs if row["coefficient"] < 0][:10]
+
+    trait_counts = get_trait_presence_counts(rows)
 
     lines: List[str] = []
     lines.append("LOGISTIC REGRESSION INTERPRETABILITY REPORT")
@@ -613,7 +663,13 @@ def write_human_readable_report(
     lines.append(f"n_negative: {negatives}")
     lines.append(f"positive_rate: {positives / len(y):.6f}")
     lines.append(f"n_features: {X.shape[1]}")
+    lines.append(f"entity_names_used: {entity_names}")
     lines.append(f"feature_names: {feature_names}")
+    lines.append("")
+    lines.append("Trait Coverage in Input JSONL")
+    lines.append("-" * 80)
+    for trait_name in sorted(trait_counts.keys()):
+        lines.append(f"{trait_name:28s} {trait_counts[trait_name]}/{len(rows)} rows")
     lines.append("")
     lines.append("Cross-Validation Summary")
     lines.append("-" * 80)
@@ -657,6 +713,7 @@ def write_human_readable_report(
     lines.append("Because features are standardized, coefficient magnitudes are directly comparable.")
     lines.append("Odds ratio > 1        -> pushes toward successful jailbreak.")
     lines.append("Odds ratio < 1        -> pushes away from successful jailbreak.")
+    lines.append("Missing trait entries in a row are encoded as zeros in this script.")
     lines.append("")
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -671,7 +728,10 @@ def main() -> None:
     metric_key = metric_key_from_metric_type(args.metric_type)
     rows = load_rows(args.summary_jsonl)
 
-    X, y, feature_names, metadata_rows = build_feature_matrix(
+    if args.debug_print_schema:
+        debug_print_schema(rows)
+
+    X, y, feature_names, metadata_rows, entity_names = build_feature_matrix(
         rows=rows,
         feature_source=args.feature_source,
         metric_key=metric_key,
@@ -704,6 +764,8 @@ def main() -> None:
         feature_names=feature_names,
     )
 
+    trait_presence_counts = get_trait_presence_counts(rows)
+
     config = {
         "summary_jsonl": args.summary_jsonl,
         "feature_source": args.feature_source,
@@ -723,7 +785,11 @@ def main() -> None:
         "n_features": int(X.shape[1]),
         "n_positive": int(y.sum()),
         "n_negative": int(len(y) - y.sum()),
+        "entity_names_used": entity_names,
         "feature_names": feature_names,
+        "trait_presence_counts": trait_presence_counts,
+        "traits_present_in_all_rows": get_trait_names_present_in_all_rows(rows),
+        "traits_present_in_any_row": get_available_trait_names(rows),
     }
 
     save_json(config, out_dir / "run_config.json")
@@ -746,6 +812,8 @@ def main() -> None:
         X=X,
         y=y,
         feature_names=feature_names,
+        entity_names=entity_names,
+        rows=rows,
         cv_results=cv_results,
         full_fit=full_fit,
         out_path=out_dir / "interpretability_report.txt",
@@ -762,6 +830,7 @@ def main() -> None:
     print("Done.")
     print(f"Outputs written to: {out_dir}")
     print(f"n_examples={len(y)}  n_features={X.shape[1]}  n_positive={int(y.sum())}  n_negative={int(len(y)-y.sum())}")
+    print(f"entity_names_used={entity_names}")
     print("Best place to start reading:")
     print(f"  1) {out_dir / 'interpretability_report.txt'}")
     print(f"  2) {out_dir / 'top_coefficients.png'}")
