@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Interview note: generates trait responses using only the 40 questions inside each trait JSON, saves rich chat-template metadata for later activation extraction.
+# Interview note: generates trait responses using only the 40 questions inside each trait JSON and saves rich chat-template metadata for later activation extraction.
 
 import argparse
 import json
@@ -23,10 +23,6 @@ from vllm import LLM, SamplingParams
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-
-# ----------------------------
-# data structures
-# ----------------------------
 
 @dataclass
 class PromptRecord:
@@ -52,10 +48,6 @@ class PromptRecord:
     full_prompt_token_ids: List[int]
 
 
-# ----------------------------
-# helpers
-# ----------------------------
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -66,6 +58,11 @@ def safe_git_commit() -> Optional[str]:
         return out.decode("utf-8").strip()
     except Exception:
         return None
+
+
+def traceback_string() -> str:
+    import traceback
+    return traceback.format_exc()
 
 
 def load_trait(trait_file: Path) -> Dict[str, Any]:
@@ -132,18 +129,9 @@ def build_span_metadata(
     system_prompt: str,
     question: str,
 ) -> Tuple[List[int], int, int, List[int], int, int, int]:
-    empty_messages = []
-    user_only_messages = [{"role": "user", "content": question}]
-
-    full_without_system = apply_chat_template_tokens(tokenizer, user_only_messages)
-    full_empty = apply_chat_template_tokens(tokenizer, empty_messages)
-
-    if len(full_prompt_token_ids) <= 0:
+    if len(full_prompt_token_ids) == 0:
         raise ValueError("Prompt token ids are empty")
 
-    # assistant header span = suffix added by add_generation_prompt=True after the last real message
-    # find by taking full prompt and subtracting the same template without generation prompt is hard,
-    # so we instead locate the final assistant header by tokenizing the messages without generation prompt
     prompt_no_gen = tokenizer.apply_chat_template(
         [
             {"role": "system", "content": system_prompt},
@@ -156,20 +144,26 @@ def build_span_metadata(
         prompt_no_gen = prompt_no_gen.tolist()
 
     if len(prompt_no_gen) >= len(full_prompt_token_ids):
-        raise ValueError("Expected generation prompt to add assistant header tokens")
+        raise ValueError(
+            "Expected add_generation_prompt=True to append assistant header tokens, "
+            f"but got len(prompt_no_gen)={len(prompt_no_gen)} and "
+            f"len(full_prompt_token_ids)={len(full_prompt_token_ids)}"
+        )
 
     assistant_header_start = len(prompt_no_gen)
     assistant_header_end = len(full_prompt_token_ids) - 1
     assistant_header_token_indices = list(range(assistant_header_start, assistant_header_end + 1))
 
-    # locate user-content tokens by searching for tokenized question content
     question_token_ids = tokenizer.encode(question, add_special_tokens=False)
+    if len(question_token_ids) == 0:
+        raise ValueError("Question encoded to zero tokens")
+
     user_content_start = find_subsequence(full_prompt_token_ids, question_token_ids)
     if user_content_start == -1:
         raise ValueError("Could not locate user-content tokens in prompt token ids")
+
     user_content_end = user_content_start + len(question_token_ids) - 1
     user_content_token_indices = list(range(user_content_start, user_content_end + 1))
-
     user_last_token_index = user_content_end
 
     return (
@@ -195,7 +189,6 @@ def build_prompt_records_for_trait(
         for polarity, system_prompt in [("positive", pair["pos"]), ("negative", pair["neg"])]:
             for question_index, question in enumerate(trait_data["questions"]):
                 messages = build_messages(system_prompt=system_prompt, question=question)
-                prompt_text = apply_chat_template_string(tokenizer, messages)
                 full_prompt_token_ids = apply_chat_template_tokens(tokenizer, messages)
 
                 (
@@ -241,7 +234,12 @@ def build_prompt_records_for_trait(
     return records
 
 
-def record_to_output_row(record: PromptRecord, assistant_response: str, model_name: str, generation_params: Dict[str, Any]) -> Dict[str, Any]:
+def record_to_output_row(
+    record: PromptRecord,
+    assistant_response: str,
+    model_name: str,
+    generation_params: Dict[str, Any],
+) -> Dict[str, Any]:
     conversation = [
         {"role": "system", "content": record.system_prompt},
         {"role": "user", "content": record.question},
@@ -282,10 +280,20 @@ def write_json(path: Path, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
-def write_error_log(log_path: Path, trait_name: str, error_text: str) -> None:
+def write_error_log(
+    log_path: Path,
+    trait_name: str,
+    error_text: str,
+    traceback_text: Optional[str] = None,
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
-        f.write(f"[{utc_now_iso()}] trait={trait_name}\n{error_text}\n\n")
+        f.write(f"[{utc_now_iso()}] trait={trait_name}\n{error_text}\n")
+        if traceback_text:
+            f.write(traceback_text)
+            if not traceback_text.endswith("\n"):
+                f.write("\n")
+        f.write("\n")
 
 
 def verify_trait_output_file(output_file: Path, trait_data: Dict[str, Any]) -> Tuple[bool, str]:
@@ -311,7 +319,11 @@ def verify_trait_output_file(output_file: Path, trait_data: Dict[str, Any]) -> T
             return False, f"Question mismatch at qidx={qidx}"
 
         pidx = row["prompt_index"]
-        expected_prompt = trait_data["instruction"][pidx]["pos"] if row["polarity"] == "positive" else trait_data["instruction"][pidx]["neg"]
+        expected_prompt = (
+            trait_data["instruction"][pidx]["pos"]
+            if row["polarity"] == "positive"
+            else trait_data["instruction"][pidx]["neg"]
+        )
         if row["system_prompt"] != expected_prompt:
             return False, f"System prompt mismatch at {row['polarity']} pidx={pidx}"
 
@@ -323,10 +335,6 @@ def verify_trait_output_file(output_file: Path, trait_data: Dict[str, Any]) -> T
 
     return True, "ok"
 
-
-# ----------------------------
-# generation core
-# ----------------------------
 
 class TraitResponseGenerator:
     def __init__(
@@ -367,7 +375,12 @@ class TraitResponseGenerator:
             n=1,
         )
 
-    def generate_trait_rows(self, trait_name: str, trait_file: Path, trait_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def generate_trait_rows(
+        self,
+        trait_name: str,
+        trait_file: Path,
+        trait_data: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
         if self.tokenizer is None or self.llm is None or self.sampling_params is None:
             raise RuntimeError("Generator not loaded")
 
@@ -405,10 +418,6 @@ class TraitResponseGenerator:
             )
         return rows
 
-
-# ----------------------------
-# worker logic
-# ----------------------------
 
 def process_traits_on_worker(worker_id: int, gpu_ids: List[int], trait_names: List[str], args) -> None:
     gpu_ids_str = ",".join(map(str, gpu_ids))
@@ -492,26 +501,17 @@ def process_traits_on_worker(worker_id: int, gpu_ids: List[int], trait_names: Li
             except Exception as e:
                 failed += 1
                 error_text = f"{type(e).__name__}: {str(e)}"
-                write_error_log(errors_log, trait_name, error_text)
+                write_error_log(errors_log, trait_name, error_text, traceback_string())
                 worker_logger.error(f"Failed trait '{trait_name}': {error_text}")
 
         worker_logger.info(f"Worker {worker_id} done. completed={completed}, failed={failed}")
 
     except Exception as e:
         error_text = f"Fatal worker error: {type(e).__name__}: {str(e)}"
-        write_error_log(errors_log, "__worker__", error_text)
+        write_error_log(errors_log, "__worker__", error_text, traceback_string())
         worker_logger.error(error_text)
         worker_logger.error(traceback_string())
 
-
-def traceback_string() -> str:
-    import traceback
-    return traceback.format_exc()
-
-
-# ----------------------------
-# orchestration
-# ----------------------------
 
 def discover_trait_names(traits_dir: Path, responses_dir: Path, selected_traits: Optional[List[str]]) -> List[str]:
     names = []
@@ -674,16 +674,12 @@ def run_single_worker(args) -> int:
 
         except Exception as e:
             error_text = f"{type(e).__name__}: {str(e)}"
-            write_error_log(errors_log, trait_name, error_text)
+            write_error_log(errors_log, trait_name, error_text, traceback_string())
             logger.error(f"Failed trait '{trait_name}': {error_text}")
 
     logger.info("Generation complete")
     return 0
 
-
-# ----------------------------
-# cli
-# ----------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
