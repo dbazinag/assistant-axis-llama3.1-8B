@@ -36,7 +36,7 @@ CALIBRATION_PROMPTS = [
     "What makes a good leader?",
 ]
 
-DEFAULT_FRACTIONS = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, -0.05, -0.10, -0.15, -0.20, -0.30]
+DEFAULT_FRACTIONS = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.45, 0.6, -0.05, -0.10, -0.15,]
 
 
 def parse_args() -> argparse.Namespace:
