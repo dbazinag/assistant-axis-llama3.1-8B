@@ -123,9 +123,14 @@ def load_full_vector(path: Path) -> torch.Tensor:
     data = torch.load(path, map_location="cpu", weights_only=False)
 
     if isinstance(data, dict):
-        if "vector" not in data:
-            raise KeyError(f"Cannot find 'vector' key in {path}. Keys: {list(data.keys())}")
-        t = data["vector"].float()
+        if "vector" in data:
+            t = data["vector"].float()
+        elif "axis" in data:
+            t = data["axis"].float()
+        else:
+            raise KeyError(
+                f"Cannot find 'vector' or 'axis' key in {path}. Keys: {list(data.keys())}"
+            )
     else:
         t = data.float()
 
@@ -314,9 +319,9 @@ def run_test(
 
 
 def emit_header(title: str):
-    print("\n" + "█" * 110)
-    print(title)
-    print("█" * 110)
+    print("\n" + "█" * 110, flush=True)
+    print(title, flush=True)
+    print("█" * 110, flush=True)
 
 
 def main():
@@ -329,18 +334,18 @@ def main():
     test_prompts = args.test_prompts if args.test_prompts else list(NEUTRAL_TEST_PROMPTS)
     calibration_prompts = args.calibration_prompts if args.calibration_prompts else list(NEUTRAL_TEST_PROMPTS)
 
-    print(f"Loading model: {args.model_id}")
+    print(f"Loading model: {args.model_id}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        torch_dtype=get_torch_dtype(args.torch_dtype),
+        dtype=get_torch_dtype(args.torch_dtype),
         device_map="auto",
     )
     model.eval()
-    print("Model loaded.")
+    print("Model loaded.", flush=True)
 
     layers = get_layers(model)
     n_layers = len(layers)
@@ -349,10 +354,10 @@ def main():
     if layer_index < 0 or layer_index >= n_layers:
         raise ValueError(f"layer_index={layer_index} out of range for model with {n_layers} layers")
 
-    print(f"Using layer index: {layer_index} / {n_layers - 1}")
-    print(f"Fractions tested: {fractions}")
-    print(f"Calibration prompts: {len(calibration_prompts)}")
-    print(f"Test prompts: {len(test_prompts)}")
+    print(f"Using layer index: {layer_index} / {n_layers - 1}", flush=True)
+    print(f"Fractions tested: {fractions}", flush=True)
+    print(f"Calibration prompts: {len(calibration_prompts)}", flush=True)
+    print(f"Test prompts: {len(test_prompts)}", flush=True)
 
     named_vectors: list[tuple[str, torch.Tensor]] = []
 
@@ -381,27 +386,27 @@ def main():
         )
 
         emit_header(f"VECTOR: {name.upper()}")
-        print(f"Vector shape: {tuple(full_vector.shape)}")
-        print(f"Selected layer: {layer_index}")
-        print(f"Vector norm at selected layer: {full_vector[layer_index].norm().item():.4f}")
-        print(f"Calibrated residual norm at selected layer: {layer_residual_norm:.4f}")
+        print(f"Vector shape: {tuple(full_vector.shape)}", flush=True)
+        print(f"Selected layer: {layer_index}", flush=True)
+        print(f"Vector norm at selected layer: {full_vector[layer_index].norm().item():.4f}", flush=True)
+        print(f"Calibrated residual norm at selected layer: {layer_residual_norm:.4f}", flush=True)
 
-        print("Top per-layer vector norms:")
+        print("Top per-layer vector norms:", flush=True)
         top_pairs = sorted(
             [(i, full_vector[i].norm().item()) for i in range(full_vector.shape[0])],
             key=lambda x: x[1],
             reverse=True,
         )[:10]
-        print("  " + ", ".join([f"L{i}={n:.3f}" for i, n in top_pairs]))
+        print("  " + ", ".join([f"L{i}={n:.3f}" for i, n in top_pairs]), flush=True)
 
-        print("Per-layer vector norm report:")
+        print("Per-layer vector norm report:", flush=True)
         for row in layer_norm_report(full_vector):
-            print("  " + row)
+            print("  " + row, flush=True)
 
         for prompt in test_prompts:
-            print("\n" + "─" * 110)
-            print(f'PROMPT: "{prompt}"')
-            print("─" * 110)
+            print("\n" + "─" * 110, flush=True)
+            print(f'PROMPT: "{prompt}"', flush=True)
+            print("─" * 110, flush=True)
 
             results = run_test(
                 model=model,
@@ -415,12 +420,12 @@ def main():
             )
 
             for r in results:
-                print(f"\n  [frac={r['fraction']:+.2f}] coeff={r['coeff']:+.4f}")
+                print(f"\n  [frac={r['fraction']:+.2f}] coeff={r['coeff']:+.4f}", flush=True)
                 for line in textwrap.wrap(r["response"], width=104):
-                    print(f"    {line}")
+                    print(f"    {line}", flush=True)
 
-    print("\n" + "=" * 110)
-    print("Done.")
+    print("\n" + "=" * 110, flush=True)
+    print("Done.", flush=True)
 
 
 if __name__ == "__main__":
