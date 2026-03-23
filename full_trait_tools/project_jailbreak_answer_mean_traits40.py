@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 
-DEFAULT_ACTS_DIR = Path("assistant_axis_outputs/llama-3.1-8b/step2/activations")
+DEFAULT_ACTS_DIR = Path("../assistant_axis_outputs/llama-3.1-8b/step2/activations")
 DEFAULT_AXIS_PATH = Path(
     "full_trait_output/traits40_axes/answer_mean/filter_matched_pairs_ge_50_count_ge_10_total/assistant_axis_pc1.pt"
 )
