@@ -62,8 +62,13 @@ def print_section(title: str) -> None:
     print("=" * 70)
 
 
+def sanitize(text: str) -> str:
+    """Remove surrogate characters that can't be printed."""
+    return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+
 def wrap(text: str, width: int = 90, indent: str = "    ") -> str:
-    return textwrap.fill(text, width=width, initial_indent=indent,
+    return textwrap.fill(sanitize(text), width=width, initial_indent=indent,
                          subsequent_indent=indent)
 
 
