@@ -1,5 +1,3 @@
-# interview note: updated logistic regression for the new jailbreak projection JSONL; supports new pre_response/answer_mean/delta metrics, zero-fills missing traits, and can do both binary jailbreak-success classification and multiclass attack-method classification including benign
-
 import argparse
 import json
 import math
@@ -412,7 +410,6 @@ def build_pipeline(
     task_mode: str,
 ) -> Pipeline:
     lr_class_weight = None if class_weight == "none" else "balanced"
-    multi_class = "ovr" if task_mode == "multiclass_attack_method" else "auto"
 
     return Pipeline(
         steps=[
@@ -426,7 +423,6 @@ def build_pipeline(
                     max_iter=max_iter,
                     random_state=random_state,
                     class_weight=lr_class_weight,
-                    multi_class=multi_class,
                 ),
             ),
         ]
@@ -640,12 +636,15 @@ def fit_full_model_multiclass(
     coef = clf.coef_.astype(np.float64)
     intercept = clf.intercept_.astype(np.float64)
 
-    class_rows = {}
-    for class_idx, class_name in idx_to_class.items():
-        feature_rows = []
-        class_coef = coef[class_idx]
+    feature_rows_by_class = {}
+
+    if coef.shape[0] == 1 and len(idx_to_class) == 2:
+        # Binary fallback presented in multiclass-style if only 2 classes ended up present
+        class_name = idx_to_class[1]
+        class_coef = coef[0]
+        rows = []
         for name, value in zip(feature_names, class_coef):
-            feature_rows.append(
+            rows.append(
                 {
                     "feature": name,
                     "coefficient": float(value),
@@ -653,11 +652,25 @@ def fit_full_model_multiclass(
                     "direction": f"pushes_toward_{class_name}" if value > 0 else f"pushes_away_from_{class_name}",
                 }
             )
-        class_rows[class_name] = sorted(feature_rows, key=lambda x: x["abs_coefficient"], reverse=True)
+        feature_rows_by_class[class_name] = sorted(rows, key=lambda x: x["abs_coefficient"], reverse=True)
+    else:
+        for class_idx, class_name in idx_to_class.items():
+            feature_rows = []
+            class_coef = coef[class_idx]
+            for name, value in zip(feature_names, class_coef):
+                feature_rows.append(
+                    {
+                        "feature": name,
+                        "coefficient": float(value),
+                        "abs_coefficient": float(abs(value)),
+                        "direction": f"pushes_toward_{class_name}" if value > 0 else f"pushes_away_from_{class_name}",
+                    }
+                )
+            feature_rows_by_class[class_name] = sorted(feature_rows, key=lambda x: x["abs_coefficient"], reverse=True)
 
     return {
-        "intercepts": {idx_to_class[i]: float(intercept[i]) for i in range(len(intercept))},
-        "feature_coefficients_by_class": class_rows,
+        "intercepts": {idx_to_class[i]: float(intercept[i]) for i in range(min(len(intercept), len(idx_to_class)))},
+        "feature_coefficients_by_class": feature_rows_by_class,
         "scaler_mean": scaler.mean_.tolist(),
         "scaler_scale": scaler.scale_.tolist(),
     }
