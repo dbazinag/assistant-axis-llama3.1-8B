@@ -193,6 +193,11 @@ def load_model_and_tokenizer(
     return model, tokenizer
 
 
+def sanitize_text(text: str) -> str:
+    """Remove surrogate characters that break the Rust-based fast tokenizer."""
+    return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+
 def get_prompt_input_ids(
     tokenizer: AutoTokenizer,
     prompt_text: str,
@@ -201,6 +206,7 @@ def get_prompt_input_ids(
     Apply Llama chat template for a single user message with no system prompt.
     Returns input_ids of shape [1, seq_len].
     """
+    prompt_text = sanitize_text(prompt_text)
     conversation = [{"role": "user", "content": prompt_text}]
     text = tokenizer.apply_chat_template(
         conversation,
