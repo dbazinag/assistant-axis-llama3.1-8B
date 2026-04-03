@@ -94,19 +94,38 @@ def filter_by_variance(
     return [r for r in rows if r["behavior_id"] in kept], sorted(kept)
 
 
-def split_pairs(
+def split_pools(
     rows: List[dict],
     train_frac: float,
     seed: int,
-) -> Tuple[Set[int], Set[int]]:
-    all_ids  = [r["pair_id"] for r in rows]
-    rng      = random.Random(seed)
-    shuffled = list(all_ids)
-    rng.shuffle(shuffled)
-    n_train   = max(1, int(len(shuffled) * train_frac))
-    train_ids = set(shuffled[:n_train])
-    test_ids  = set(shuffled[n_train:])
-    return train_ids, test_ids
+) -> Tuple[Set[str], Set[str], Set[int], Set[int]]:
+    """
+    Splits behaviors and jailbreak templates into completely separate pools.
+
+    Train set = (train_behavior, train_template) pairs only.
+    Test set  = (test_behavior,  test_template)  pairs only.
+    Mixed pairs (train_behavior + test_template or vice versa) are dropped.
+
+    This ensures the classifier sees no behavior AND no jailbreak template
+    from the test set during training.
+    """
+    rng = random.Random(seed)
+
+    all_behaviors = sorted({r["behavior_id"]  for r in rows})
+    all_templates = sorted({r["jailbreak_idx"] for r in rows})
+
+    rng.shuffle(all_behaviors)
+    rng.shuffle(all_templates)
+
+    n_train_beh = max(1, int(len(all_behaviors) * train_frac))
+    n_train_tpl = max(1, int(len(all_templates) * train_frac))
+
+    train_behaviors = set(all_behaviors[:n_train_beh])
+    test_behaviors  = set(all_behaviors[n_train_beh:])
+    train_templates = set(all_templates[:n_train_tpl])
+    test_templates  = set(all_templates[n_train_tpl:])
+
+    return train_behaviors, test_behaviors, train_templates, test_templates
 
 
 # ── Feature matrix ─────────────────────────────────────────────────────────────
@@ -115,16 +134,22 @@ def build_feature_matrix(
     rows: List[dict],
     activations: Dict[int, Dict[str, torch.Tensor]],
     layer: int,
-    pair_ids: Set[int],
+    behavior_pool: Set[str],
+    template_pool: Set[int],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns X [n_samples, 4096] and y [n_samples] using raw activations.
+
+    Only includes rows where BOTH the behavior AND the jailbreak template
+    are in the specified pools. Mixed-membership rows are dropped.
     """
     layer_key = str(layer)
     X_list, y_list = [], []
 
     for row in rows:
-        if row["pair_id"] not in pair_ids:
+        if row["behavior_id"]   not in behavior_pool:
+            continue
+        if row["jailbreak_idx"] not in template_pool:
             continue
         pid = row["pair_id"]
         if pid not in activations or layer_key not in activations[pid]:
@@ -297,19 +322,32 @@ def main() -> None:
           f"({100*(len(rows_filtered)-n_jb)/len(rows_filtered):.1f}%)")
 
     # ── Split ──────────────────────────────────────────────────────────────────
-    train_ids, test_ids = split_pairs(rows_filtered, args.train_frac, args.seed)
-    train_rows = [r for r in rows_filtered if r["pair_id"] in train_ids]
-    test_rows  = [r for r in rows_filtered if r["pair_id"] in test_ids]
+    train_behaviors, test_behaviors, train_templates, test_templates = split_pools(
+        rows_filtered, args.train_frac, args.seed
+    )
+
+    train_rows = [
+        r for r in rows_filtered
+        if r["behavior_id"] in train_behaviors and r["jailbreak_idx"] in train_templates
+    ]
+    test_rows = [
+        r for r in rows_filtered
+        if r["behavior_id"] in test_behaviors and r["jailbreak_idx"] in test_templates
+    ]
+    dropped = len(rows_filtered) - len(train_rows) - len(test_rows)
 
     train_pos = sum(r["jailbroken"] for r in train_rows)
     test_pos  = sum(r["jailbroken"] for r in test_rows)
-    print(f"\n  Pair-level split:")
-    print(f"    Train: {len(train_rows)} pairs "
+    print(f"\n  Strict pool split:")
+    print(f"    Train behaviors : {len(train_behaviors)} | Train templates: {len(train_templates)}")
+    print(f"    Test behaviors  : {len(test_behaviors)}  | Test templates : {len(test_templates)}")
+    print(f"    Train pairs     : {len(train_rows)} "
           f"(pos={train_pos}, neg={len(train_rows)-train_pos}, "
-          f"rate={100*train_pos/len(train_rows):.1f}%)")
-    print(f"    Test : {len(test_rows)} pairs "
+          f"rate={100*train_pos/max(1,len(train_rows)):.1f}%)")
+    print(f"    Test pairs      : {len(test_rows)} "
           f"(pos={test_pos}, neg={len(test_rows)-test_pos}, "
-          f"rate={100*test_pos/len(test_rows):.1f}%)")
+          f"rate={100*test_pos/max(1,len(test_rows)):.1f}%)")
+    print(f"    Dropped (mixed) : {dropped} pairs ({100*dropped/max(1,len(rows_filtered)):.1f}%)")
 
     # ── Run per layer ──────────────────────────────────────────────────────────
     all_results  = {}
@@ -320,10 +358,10 @@ def main() -> None:
         print(f"  Layer {layer}: building feature matrices (raw 4096-dim)...")
 
         X_train, y_train = build_feature_matrix(
-            rows_filtered, activations, layer, train_ids
+            rows_filtered, activations, layer, train_behaviors, train_templates
         )
         X_test, y_test = build_feature_matrix(
-            rows_filtered, activations, layer, test_ids
+            rows_filtered, activations, layer, test_behaviors, test_templates
         )
 
         if len(X_train) == 0 or len(X_test) == 0:
@@ -361,7 +399,7 @@ def main() -> None:
     summary = {
         "label_source":   "LLM judge" if has_llm else "HarmBench classifier",
         "feature_space":  "raw_activations_4096dim",
-        "split_strategy": "strict_pair_level",
+        "split_strategy": "strict_behavior_and_template_pool_split",
         "config": {
             "classified_path":   args.classified_path,
             "activations_path":  args.activations_path,
@@ -375,8 +413,13 @@ def main() -> None:
             "n_behaviors_total":     len(success_rates),
             "n_behaviors_kept":      len(kept_behaviors),
             "n_pairs_total":         len(rows_filtered),
+            "n_train_behaviors":     len(train_behaviors),
+            "n_test_behaviors":      len(test_behaviors),
+            "n_train_templates":     len(train_templates),
+            "n_test_templates":      len(test_templates),
             "n_train_pairs":         len(train_rows),
             "n_test_pairs":          len(test_rows),
+            "n_dropped_pairs":       dropped,
             "rate_distribution":     rate_distribution,
             "behavior_success_rates": success_rates,
         },

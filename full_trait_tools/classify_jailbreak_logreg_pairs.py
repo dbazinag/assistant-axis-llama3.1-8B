@@ -122,32 +122,29 @@ def filter_by_variance(
 
 # ── Pair-level train/test split ────────────────────────────────────────────────
 
-def split_pairs(
+def split_pools(
     rows: List[dict],
     train_frac: float,
     seed: int,
-) -> Tuple[Set[int], Set[int]]:
+) -> Tuple[Set[str], Set[str], Set[int], Set[int]]:
     """
-    Split (behavior, jailbreak_template) pairs strictly into train and test.
-
-    Each unique pair_id maps to exactly one set. We shuffle all pair_ids
-    and assign the first train_frac to train, the rest to test.
-
-    This guarantees no behavior AND no jailbreak_idx seen in training
-    appears in test, since each unique combination is a unique pair_id.
-
-    Returns train_pair_ids, test_pair_ids as sets.
+    Splits behaviors and jailbreak templates into completely separate pools.
+    Train set = (train_behavior, train_template) pairs only.
+    Test set  = (test_behavior,  test_template)  pairs only.
+    Mixed pairs are dropped entirely.
     """
-    all_pair_ids = [r["pair_id"] for r in rows]
     rng = random.Random(seed)
-    shuffled = list(all_pair_ids)
-    rng.shuffle(shuffled)
-
-    n_train = max(1, int(len(shuffled) * train_frac))
-    train_ids = set(shuffled[:n_train])
-    test_ids  = set(shuffled[n_train:])
-
-    return train_ids, test_ids
+    all_behaviors = sorted({r["behavior_id"]   for r in rows})
+    all_templates = sorted({r["jailbreak_idx"]  for r in rows})
+    rng.shuffle(all_behaviors)
+    rng.shuffle(all_templates)
+    n_train_beh = max(1, int(len(all_behaviors) * train_frac))
+    n_train_tpl = max(1, int(len(all_templates) * train_frac))
+    train_behaviors = set(all_behaviors[:n_train_beh])
+    test_behaviors  = set(all_behaviors[n_train_beh:])
+    train_templates = set(all_templates[:n_train_tpl])
+    test_templates  = set(all_templates[n_train_tpl:])
+    return train_behaviors, test_behaviors, train_templates, test_templates
 
 
 # ── Feature matrix ─────────────────────────────────────────────────────────────
@@ -169,13 +166,16 @@ def build_feature_matrix(
     trait_vectors: np.ndarray,
     axis_vector: np.ndarray,
     layer: int,
-    pair_ids: Set[int],
+    behavior_pool: Set[str],
+    template_pool: Set[int],
 ) -> Tuple[np.ndarray, np.ndarray]:
     layer_key = str(layer)
     X_list, y_list = [], []
 
     for row in rows:
-        if row["pair_id"] not in pair_ids:
+        if row["behavior_id"]   not in behavior_pool:
+            continue
+        if row["jailbreak_idx"] not in template_pool:
             continue
         pid = row["pair_id"]
         if pid not in activations or layer_key not in activations[pid]:
@@ -371,50 +371,33 @@ def main() -> None:
     if len(kept_behaviors) < 10:
         print("\n  WARNING: Very few behaviors kept — consider loosening the filter.")
 
-    # ── Strict pair-level split ────────────────────────────────────────────────
-    train_ids, test_ids = split_pairs(
+    # ── Strict pool split ─────────────────────────────────────────────────────
+    train_behaviors, test_behaviors, train_templates, test_templates = split_pools(
         rows_filtered,
         train_frac=args.train_frac,
         seed=args.seed,
     )
-
-    # Verify no overlap
-    assert len(train_ids & test_ids) == 0, "Overlap between train and test pair IDs!"
-
-    # Print split stats
-    train_rows = [r for r in rows_filtered if r["pair_id"] in train_ids]
-    test_rows  = [r for r in rows_filtered if r["pair_id"] in test_ids]
-
+    train_rows = [
+        r for r in rows_filtered
+        if r["behavior_id"] in train_behaviors and r["jailbreak_idx"] in train_templates
+    ]
+    test_rows = [
+        r for r in rows_filtered
+        if r["behavior_id"] in test_behaviors and r["jailbreak_idx"] in test_templates
+    ]
+    dropped   = len(rows_filtered) - len(train_rows) - len(test_rows)
     train_pos = sum(r["jailbroken"] for r in train_rows)
     test_pos  = sum(r["jailbroken"] for r in test_rows)
-
-    print(f"\n  Pair-level split:")
-    print(f"    Train: {len(train_rows)} pairs  "
+    print(f"\n  Strict pool split:")
+    print(f"    Train behaviors : {len(train_behaviors)} | Train templates: {len(train_templates)}")
+    print(f"    Test behaviors  : {len(test_behaviors)}  | Test templates : {len(test_templates)}")
+    print(f"    Train pairs     : {len(train_rows)} "
           f"(pos={train_pos}, neg={len(train_rows)-train_pos}, "
-          f"rate={100*train_pos/len(train_rows):.1f}%)")
-    print(f"    Test : {len(test_rows)} pairs  "
+          f"rate={100*train_pos/max(1,len(train_rows)):.1f}%)")
+    print(f"    Test pairs      : {len(test_rows)} "
           f"(pos={test_pos}, neg={len(test_rows)-test_pos}, "
-          f"rate={100*test_pos/len(test_rows):.1f}%)")
-
-    # Verify strict separation
-    train_behaviors_seen  = {r["behavior_id"]  for r in train_rows}
-    test_behaviors_seen   = {r["behavior_id"]  for r in test_rows}
-    train_jb_idx_seen     = {r["jailbreak_idx"] for r in train_rows}
-    test_jb_idx_seen      = {r["jailbreak_idx"] for r in test_rows}
-    behavior_overlap      = train_behaviors_seen  & test_behaviors_seen
-    jb_idx_overlap        = train_jb_idx_seen     & test_jb_idx_seen
-
-    print(f"\n  Strict separation check:")
-    print(f"    Behavior overlap     : {len(behavior_overlap)} "
-          f"({'⚠️  WARNING' if behavior_overlap else '✓ none'})")
-    print(f"    Jailbreak idx overlap: {len(jb_idx_overlap)} "
-          f"({'⚠️  WARNING' if jb_idx_overlap else '✓ none'})")
-
-    if behavior_overlap or jb_idx_overlap:
-        print("\n  NOTE: Some overlap is expected with random pair splitting —")
-        print("  the split is on pair_ids, not on behaviors or template indices.")
-        print("  For zero overlap on both dimensions simultaneously, the dataset")
-        print("  would need to be much larger. Results are still valid.")
+          f"rate={100*test_pos/max(1,len(test_rows)):.1f}%)")
+    print(f"    Dropped (mixed) : {dropped} pairs ({100*dropped/max(1,len(rows_filtered)):.1f}%)")
 
     # ── Run classifier per layer ───────────────────────────────────────────────
     all_results = {}
@@ -434,11 +417,11 @@ def main() -> None:
 
         X_train, y_train = build_feature_matrix(
             rows_filtered, activations, trait_vectors, axis_vector,
-            layer, train_ids,
+            layer, train_behaviors, train_templates,
         )
         X_test, y_test = build_feature_matrix(
             rows_filtered, activations, trait_vectors, axis_vector,
-            layer, test_ids,
+            layer, test_behaviors, test_templates,
         )
 
         if len(X_train) == 0 or len(X_test) == 0:
@@ -455,7 +438,7 @@ def main() -> None:
     # ── Save summary ───────────────────────────────────────────────────────────
     summary = {
         "label_source": label_source,
-        "split_strategy": "strict_pair_level",
+        "split_strategy": "strict_behavior_and_template_pool_split",
         "config": {
             "classified_path":   args.classified_path,
             "activations_path":  args.activations_path,
@@ -471,10 +454,13 @@ def main() -> None:
             "n_behaviors_total":     len(success_rates),
             "n_behaviors_kept":      len(kept_behaviors),
             "n_pairs_total":         len(rows_filtered),
+            "n_train_behaviors":     len(train_behaviors),
+            "n_test_behaviors":      len(test_behaviors),
+            "n_train_templates":     len(train_templates),
+            "n_test_templates":      len(test_templates),
             "n_train_pairs":         len(train_rows),
             "n_test_pairs":          len(test_rows),
-            "behavior_overlap":      list(behavior_overlap),
-            "jb_idx_overlap":        list(jb_idx_overlap),
+            "n_dropped_pairs":       dropped,
             "rate_distribution":     rate_distribution,
             "behavior_success_rates": success_rates,
         },
