@@ -42,8 +42,8 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import StandardScaler
 
-RANDOM_SEED         = 42
-TRAIN_PAIR_FRAC     = 0.8
+RANDOM_SEED         = 43
+TRAIN_PAIR_FRAC     = 0.7
 MIN_SUCCESS_RATE    = 0.20
 MAX_SUCCESS_RATE    = 0.80
 LAYERS              = [16, 28]
