@@ -53,7 +53,7 @@ N_SEEDS          = 10
 N_TOP            = 20
 
 # Sweet-spot dimensionalities from pca_sweep_stability.py
-DEFAULT_N_PCA = {16: 5, 28: 10}
+DEFAULT_N_PCA = {16: 5, 28: 5}
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
