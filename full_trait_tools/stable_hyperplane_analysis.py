@@ -47,7 +47,7 @@ MIN_SUCCESS_RATE = 0.20
 MAX_SUCCESS_RATE = 0.80
 LAYERS           = [16, 28]
 N_SEEDS          = 10
-N_PCA_COMPONENTS = 25   # keep top 100 PCs — adjust if variance explained is too low
+N_PCA_COMPONENTS = 15   # keep top 100 PCs — adjust if variance explained is too low
 N_TOP            = 20
 
 
