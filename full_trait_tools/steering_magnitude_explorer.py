@@ -194,11 +194,17 @@ def get_residual_norm(model, tokenizer, layer_index, device, n: int = 6) -> floa
     return float(np.mean(norms))
 
 
+def sanitize_text(text: str) -> str:
+    """Remove surrogate characters that break the fast tokenizer."""
+    return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+
 def generate_with_steering(
     model, tokenizer, prompt, unit_vec,
     layer_index, residual_norm, alpha,
     max_new_tokens, device,
 ) -> str:
+    prompt = sanitize_text(prompt)
     msgs = [{"role": "user", "content": prompt}]
     input_ids = tokenizer.apply_chat_template(
         msgs, tokenize=True, add_generation_prompt=True,
