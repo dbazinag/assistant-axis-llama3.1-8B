@@ -408,7 +408,7 @@ def main() -> None:
         axis_vector = load_axis(Path(args.axis_path), layer)
 
         # ── Level 1: standalone AUC per PC ────────────────────────────────────
-        print(f"  Computing standalone AUC per PC ({n_seeds} seeds)...")
+        print(f"  Computing standalone AUC per PC ({args.n_seeds} seeds)...")
         standalone_aucs = standalone_auc_per_pc(
             rows_filtered, activations, layer,
             pca, scaler, n_pca,
@@ -465,6 +465,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # fix variable name used before assignment
-    N_SEEDS = 8
     main()
