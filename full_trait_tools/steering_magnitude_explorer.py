@@ -6,23 +6,18 @@ Explores steering magnitudes for jailbreak suppression by printing raw
 model outputs for manual inspection. Use this to pick the right alpha
 before running the full evaluation with GPT judging.
 
+Reconstructs the actual jailbreak-wrapped prompts from responses.jsonl
+using the same jailbreak templates fetched from HarmBench GitHub.
+
 Steering directions tested:
-  - Full w (jailbreak direction, negative = protective)
-  - Full w (positive = toward jailbreak, for causal validation)
-  - PC1 direction (protective)
+  - Full w (protective: -w, push away from jailbreak)
+  - Full w (jailbreak: +w, causal validation)
+  - PC1 direction (protective: +PC1, assistant_axis aligned at layer 16)
   - Top 3 protective traits: erudite, cautious, regulatory
   - Top 3 jailbreak traits steered protectively: naive, impulsive, confident
 
-For each direction, prints outputs at alphas [0.05, 0.10, 0.15, 0.20, 0.25]
-on 5 example jailbreak prompts so you can read and pick the best alpha.
-
 Usage:
   OPENAI_API_KEY=sk-... uv run full_trait_tools/steering_magnitude_explorer.py
-
-  # Custom paths
-  OPENAI_API_KEY=sk-... uv run full_trait_tools/steering_magnitude_explorer.py \\
-    --n_examples 5 \\
-    --alphas 0.05,0.10,0.15,0.20,0.25
 """
 
 import argparse
@@ -30,6 +25,7 @@ import json
 import os
 import random
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -43,13 +39,51 @@ MODEL_NAME       = "meta-llama/Llama-3.1-8B-Instruct"
 LAYER_INDEX      = 16
 RANDOM_SEED      = 42
 MAX_NEW_TOKENS   = 200
-MIN_SUCCESS_RATE = 0.20
-MAX_SUCCESS_RATE = 0.80
 N_PCA            = 4
 
 PROTECTIVE_TRAITS   = ["erudite", "cautious", "regulatory"]
 JAILBREAK_TRAITS    = ["naive", "impulsive", "confident"]
 DEFAULT_ALPHAS      = [0.05, 0.10, 0.15, 0.20, 0.25]
+
+JAILBREAKS_URL = (
+    "https://raw.githubusercontent.com/centerforaisafety/HarmBench"
+    "/main/baselines/human_jailbreaks/jailbreaks.py"
+)
+SKIP_JAILBREAK_INDICES = {16, 44}
+
+
+# ── Prompt reconstruction ──────────────────────────────────────────────────────
+
+def load_jailbreak_templates(seed: int = 42, n_samples: int = 20) -> Dict[int, str]:
+    print("  Fetching jailbreak templates from HarmBench GitHub...")
+    with urllib.request.urlopen(JAILBREAKS_URL) as resp:
+        source = resp.read().decode("utf-8")
+    ns: dict = {}
+    exec(source, ns)  # noqa: S102
+    raw = ns["JAILBREAKS"]
+    valid = [
+        (i, jb) for i, jb in enumerate(raw)
+        if i not in SKIP_JAILBREAK_INDICES and "{0}" in jb
+    ]
+    rng = random.Random(seed)
+    sampled = rng.sample(valid, min(n_samples, len(valid)))
+    print(f"  Loaded {len(sampled)} templates "
+          f"(indices: {sorted(i for i, _ in sampled)})")
+    return {idx: template for idx, template in sampled}
+
+
+def reconstruct_prompt(row: dict, templates: Dict[int, str]) -> str:
+    if row.get("attack_type") == "direct_request":
+        return row["behavior_text"]
+    jb_idx = row["jailbreak_idx"]
+    template = templates.get(jb_idx)
+    if template is None:
+        print(f"  WARNING: template idx {jb_idx} not found, using raw behavior")
+        return row["behavior_text"]
+    try:
+        return template.format(row["behavior_text"])
+    except (KeyError, IndexError):
+        return row["behavior_text"]
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -89,16 +123,12 @@ def sample_jailbroken_pairs(
     classified_path: Path,
     n_samples: int,
     seed: int,
+    templates: Dict[int, str],
 ) -> List[dict]:
-    """
-    Sample jailbroken pairs stratified by behavior — 1 per behavior,
-    up to n_samples total.
-    """
     rows = load_jsonl(classified_path)
     rows = [r for r in rows if r.get("attack_type") == "human_jailbreak"
             and r.get("jailbroken", False)]
 
-    # Group by behavior, pick one per behavior
     by_behavior: Dict[str, List[dict]] = {}
     for r in rows:
         by_behavior.setdefault(r["behavior_id"], []).append(r)
@@ -109,7 +139,12 @@ def sample_jailbroken_pairs(
         sampled.append(rng.choice(behavior_rows))
 
     rng.shuffle(sampled)
-    return sampled[:n_samples]
+    sampled = sampled[:n_samples]
+
+    for r in sampled:
+        r["formatted_prompt"] = reconstruct_prompt(r, templates)
+
+    return sampled
 
 
 # ── Model helpers ──────────────────────────────────────────────────────────────
@@ -119,7 +154,6 @@ def load_model_and_tokenizer(model_name: str, device: torch.device):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
@@ -129,33 +163,24 @@ def load_model_and_tokenizer(model_name: str, device: torch.device):
     return model, tokenizer
 
 
-def get_residual_norm(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    layer_index: int,
-    device: torch.device,
-    n_calibration: int = 6,
-) -> float:
-    """Calibrate residual stream norm at layer_index."""
-    calibration_prompts = [
+def get_residual_norm(model, tokenizer, layer_index, device, n: int = 6) -> float:
+    prompts = [
         "Introduce yourself.",
         "What is the capital of France?",
         "How does photosynthesis work?",
         "Describe your communication style.",
         "What makes a good leader?",
         "Explain gravity simply.",
-    ][:n_calibration]
-
+    ][:n]
     norms = []
-    layers = model.model.layers
 
     def hook_fn(module, inputs, output):
         hidden = output[0] if isinstance(output, tuple) else output
         norms.append(hidden.float().norm(dim=-1).mean().item())
 
-    handle = layers[layer_index].register_forward_hook(hook_fn)
+    handle = model.model.layers[layer_index].register_forward_hook(hook_fn)
     try:
-        for prompt in calibration_prompts:
+        for prompt in prompts:
             msgs = [{"role": "user", "content": prompt}]
             ids = tokenizer.apply_chat_template(
                 msgs, tokenize=True, add_generation_prompt=True,
@@ -169,34 +194,10 @@ def get_residual_norm(
     return float(np.mean(norms))
 
 
-def build_steering_hook(
-    unit_vec: np.ndarray,
-    layer_index: int,
-    residual_norm: float,
-    alpha: float,
-):
-    """Returns a forward hook that adds alpha * residual_norm * unit_vec."""
-    vec_t = torch.from_numpy(unit_vec).float()
-
-    def hook_fn(module, inputs, output):
-        hidden = output[0] if isinstance(output, tuple) else output
-        delta = (alpha * residual_norm * vec_t).to(hidden.device, hidden.dtype)
-        hidden = hidden + delta.view(1, 1, -1)
-        return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
-
-    return hook_fn
-
-
 def generate_with_steering(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    prompt: str,
-    unit_vec: Optional[np.ndarray],
-    layer_index: int,
-    residual_norm: float,
-    alpha: float,
-    max_new_tokens: int,
-    device: torch.device,
+    model, tokenizer, prompt, unit_vec,
+    layer_index, residual_norm, alpha,
+    max_new_tokens, device,
 ) -> str:
     msgs = [{"role": "user", "content": prompt}]
     input_ids = tokenizer.apply_chat_template(
@@ -206,7 +207,14 @@ def generate_with_steering(
 
     handle = None
     if unit_vec is not None and alpha != 0.0:
-        hook_fn = build_steering_hook(unit_vec, layer_index, residual_norm, alpha)
+        vec_t = torch.from_numpy(unit_vec).float()
+
+        def hook_fn(module, inputs, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            delta = (alpha * residual_norm * vec_t).to(hidden.device, hidden.dtype)
+            hidden = hidden + delta.view(1, 1, -1)
+            return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
+
         handle = model.model.layers[layer_index].register_forward_hook(hook_fn)
 
     try:
@@ -225,33 +233,25 @@ def generate_with_steering(
     return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
 
-# ── PCA helpers ────────────────────────────────────────────────────────────────
+# ── PCA ────────────────────────────────────────────────────────────────────────
 
-def fit_pca(
-    classified_path: Path,
-    activations_path: Path,
-    layer: int,
-    n_pca: int,
-) -> Tuple[PCA, StandardScaler]:
-    """Refit PCA on all harmbench activations (same as other scripts)."""
+def fit_pca(classified_path, activations_path, layer, n_pca):
     rows = load_jsonl(classified_path)
     rows = [r for r in rows if r.get("attack_type") == "human_jailbreak"]
     activations = load_activations(activations_path)
-
     layer_key = str(layer)
     X_list = []
     for row in rows:
         pid = row["pair_id"]
         if pid in activations and layer_key in activations[pid]:
             X_list.append(activations[pid][layer_key].float().numpy())
-
     X_all = np.stack(X_list)
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_all)
     pca = PCA(n_components=n_pca, random_state=RANDOM_SEED)
     pca.fit(X_scaled)
-    print(f"  PCA fitted on {len(X_list)} activations, "
-          f"var explained: {[f'{100*v:.1f}%' for v in pca.explained_variance_ratio_]}")
+    print(f"  PCA fitted, var explained: "
+          f"{[f'{100*v:.1f}%' for v in pca.explained_variance_ratio_]}")
     return pca, scaler
 
 
@@ -278,14 +278,19 @@ def main() -> None:
 
     alphas = [float(a) for a in args.alphas.split(",")]
 
-    # ── Sample prompts ─────────────────────────────────────────────────────────
+    # ── Load templates + sample ────────────────────────────────────────────────
+    print("Loading jailbreak templates...")
+    templates = load_jailbreak_templates(seed=RANDOM_SEED, n_samples=20)
+
     print("Sampling jailbroken pairs...")
     pairs = sample_jailbroken_pairs(
-        Path(args.classified_path), args.n_examples, args.seed
+        Path(args.classified_path), args.n_examples, args.seed, templates
     )
     print(f"  Sampled {len(pairs)} pairs")
     for i, p in enumerate(pairs):
         print(f"  [{i}] {p['behavior_id']}: {p['behavior_text'][:60]}...")
+        print(f"       template_idx={p['jailbreak_idx']}, "
+              f"prompt_len={len(p['formatted_prompt'])} chars")
 
     # ── Load model ─────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -299,20 +304,16 @@ def main() -> None:
     # ── Load steering vectors ──────────────────────────────────────────────────
     print("\nLoading steering vectors...")
     w_vec = load_hyperplane(Path(args.hyperplane_path))
-    print(f"  Loaded w (jailbreak hyperplane normal)")
+    print("  Loaded w")
 
-    # Fit PCA for PC1
     print("  Fitting PCA for PC1 direction...")
-    pca, scaler = fit_pca(
-        Path(args.classified_path),
-        Path(args.activations_path),
-        args.layer_index,
-        N_PCA,
+    pca, _ = fit_pca(
+        Path(args.classified_path), Path(args.activations_path),
+        args.layer_index, N_PCA,
     )
     pc1_vec = pca.components_[0]
     pc1_vec = pc1_vec / (np.linalg.norm(pc1_vec) + 1e-12)
 
-    # Load trait vectors
     trait_vecs = {}
     vectors_dir = Path(args.trait_vectors_dir)
     for trait in PROTECTIVE_TRAITS + JAILBREAK_TRAITS:
@@ -322,41 +323,32 @@ def main() -> None:
         except FileNotFoundError as e:
             print(f"  WARNING: {e}")
 
-    # ── Build steering conditions ──────────────────────────────────────────────
-    # Each condition: (name, unit_vec, alpha_sign)
-    # alpha_sign: +1 = steer in vector direction, -1 = steer against vector direction
+    # ── Conditions ─────────────────────────────────────────────────────────────
     conditions = [
-        # Baseline
-        ("baseline", None, 1),
-        # w: negative = protective (push away from jailbreak)
-        ("w_protective (-w)", w_vec, -1),
-        # w: positive = toward jailbreak (causal validation)
-        ("w_jailbreak (+w)", w_vec, +1),
-        # PC1: positive direction aligns with assistant_axis at layer16 → protective
-        ("PC1_protective (+PC1)", pc1_vec, +1),
+        ("baseline",                     None,     0),
+        ("w_protective (-w)",            w_vec,   -1),
+        ("w_jailbreak (+w)",             w_vec,   +1),
+        ("PC1_protective (+PC1)",        pc1_vec, +1),
     ]
-
-    # Protective traits — steer in their natural direction (they point away from jailbreak)
     for trait in PROTECTIVE_TRAITS:
         if trait in trait_vecs:
-            conditions.append((f"{trait}_protective", trait_vecs[trait], +1))
-
-    # Jailbreak traits — steer AGAINST them to be protective
+            conditions.append((f"{trait} (+)", trait_vecs[trait], +1))
     for trait in JAILBREAK_TRAITS:
         if trait in trait_vecs:
-            conditions.append((f"{trait}_steered_against (-{trait})", trait_vecs[trait], -1))
+            conditions.append((f"{trait} steered against (-)", trait_vecs[trait], -1))
 
     # ── Run ────────────────────────────────────────────────────────────────────
     sep = "█" * 100
 
     for pair_idx, pair in enumerate(pairs):
-        prompt = pair.get("formatted_prompt") or pair.get("behavior_text", "")
+        prompt   = pair["formatted_prompt"]
         behavior = pair["behavior_text"]
 
         print(f"\n\n{sep}")
         print(f"EXAMPLE {pair_idx+1}/{len(pairs)}")
-        print(f"Behavior: {behavior}")
-        print(f"Prompt (first 200 chars): {prompt[:200]}...")
+        print(f"Behavior : {behavior}")
+        print(f"Template : {pair['jailbreak_idx']}")
+        print(f"Prompt (first 300 chars):\n  {prompt[:300]}...")
         print(sep)
 
         for cond_name, unit_vec, sign in conditions:
@@ -365,14 +357,13 @@ def main() -> None:
             print(f"{'─'*100}")
 
             if unit_vec is None:
-                # Baseline — no steering
                 response = generate_with_steering(
                     model, tokenizer, prompt, None,
                     args.layer_index, residual_norm, 0.0,
                     args.max_new_tokens, device,
                 )
                 print(f"\n  [alpha=0.00 baseline]")
-                print(f"  {response[:300]}")
+                print(f"  {response[:400]}")
             else:
                 for alpha in alphas:
                     effective_alpha = sign * alpha
@@ -382,14 +373,13 @@ def main() -> None:
                         args.max_new_tokens, device,
                     )
                     print(f"\n  [alpha={effective_alpha:+.2f}]")
-                    # Print first 300 chars to keep readable
-                    print(f"  {response[:300]}")
-                    if len(response) > 300:
-                        print(f"  ...")
+                    print(f"  {response[:400]}")
+                    if len(response) > 400:
+                        print("  ...")
 
     print(f"\n\n{sep}")
     print("DONE. Review outputs above and pick your alpha.")
-    print("Then run steering_robustness_eval.py with --alpha <chosen_value>")
+    print("Then run: OPENAI_API_KEY=sk-... uv run full_trait_tools/steering_robustness_eval.py --alpha <value>")
     print(sep)
 
 
