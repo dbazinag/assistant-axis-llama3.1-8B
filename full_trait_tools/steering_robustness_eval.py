@@ -238,7 +238,7 @@ def get_residual_norm(model, tokenizer, layer_index, device, n: int = 6) -> floa
                 return_tensors="pt"
             ).to(device)
             with torch.no_grad():
-                model(input_ids=ids)
+                model(input_ids=ids, attention_mask=torch.ones_like(ids))
     finally:
         handle.remove()
 
@@ -278,6 +278,7 @@ def generate_with_steering(
         with torch.no_grad():
             out = model.generate(
                 input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
