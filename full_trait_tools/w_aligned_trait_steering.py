@@ -20,7 +20,7 @@ PART 1 — Protective steering on jailbroken pairs:
 
 PART 2 — Jailbreak induction on refused pairs:
   A. Toward inductive traits: top1, top2, top3, top4, top5, top5+axis_against
-  B. Toward protective traits: top3 only (asymmetry test)
+  B. Against protective traits: top3 only (asymmetry test)
 
 Alphas: 0.05, 0.10, 0.15, 0.20, 0.25, 0.50
 Samples: 100 jailbroken + 100 refused, strict test-set-only pairs.
@@ -187,10 +187,28 @@ def sample_test_pairs(
         by_behavior.setdefault(r["behavior_id"], []).append(r)
 
     rng = random.Random(seed)
+
+    # First pass: one pair per behavior (ensures diversity)
     sampled = []
-    for _, behavior_rows in by_behavior.items():
-        sampled.append(rng.choice(behavior_rows))
+    remaining: Dict[str, List[dict]] = {}
+    for behavior_id, behavior_rows in by_behavior.items():
+        shuffled = list(behavior_rows)
+        rng.shuffle(shuffled)
+        sampled.append(shuffled[0])
+        if len(shuffled) > 1:
+            remaining[behavior_id] = shuffled[1:]
+
     rng.shuffle(sampled)
+
+    # Second pass: add more pairs per behavior until we hit n_samples
+    if len(sampled) < n_samples:
+        extra = []
+        for behavior_id, behavior_rows in remaining.items():
+            for row in behavior_rows:
+                extra.append(row)
+        rng.shuffle(extra)
+        sampled = sampled + extra[:n_samples - len(sampled)]
+
     sampled = sampled[:n_samples]
 
     for r in sampled:
@@ -558,12 +576,12 @@ def main() -> None:
             combine_vectors(vecs), +1
         ))
 
-    # B. Toward protective traits — top 3 only (asymmetry test)
+    # B. Against protective traits — top 3 only (asymmetry test)
     if len(avail_prot) >= 3:
         combo = avail_prot[:3]
         vecs  = [prot_vecs[t] for t in combo]
-        name  = f"ASYM: toward_prot_top3 (+{'+'.join(combo)})"
-        ind_conditions.append((name, combine_vectors(vecs), +1))
+        name  = f"ASYM: against_prot_top3 (-{'+'.join(combo)})"
+        ind_conditions.append((name, combine_vectors(vecs), -1))
 
     # ── Print plan ─────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
@@ -660,10 +678,10 @@ def main() -> None:
         print(f"    JB rate: {r['n_jailbroken']}/{r['n_valid']} = {100*r['jb_rate']:.0f}%")
 
     # Asymmetric induction direction
-    asym_ind_name = f"ASYM: toward_prot_top3 (+{'+'.join(avail_prot[:3])})"
+    asym_ind_name = f"ASYM: against_prot_top3 (-{'+'.join(avail_prot[:3])})"
     if asym_ind_name in ind_results:
         r = compute_rates(ind_results[asym_ind_name][best_alpha])
-        print(f"\n  Asymmetry test (toward prot traits) at a={best_alpha}:")
+        print(f"  Asymmetry test (against prot traits) at a={best_alpha}:")
         print(f"    JB rate: {r['n_jailbroken']}/{r['n_valid']} = {100*r['jb_rate']:.0f}%")
 
     print(f"\n  If asymmetry hypothesis holds:")
