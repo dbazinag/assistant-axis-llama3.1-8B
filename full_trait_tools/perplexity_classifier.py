@@ -194,6 +194,10 @@ def compute_perplexity(
     Returns perplexity as a float (lower = more fluent/natural).
     """
     try:
+        # Sanitize to remove surrogate characters
+        text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        if not text.strip():
+            return float("nan")
         # Apply chat template — same format as collection
         conversation = [{"role": "user", "content": text}]
         formatted = tokenizer.apply_chat_template(
@@ -246,7 +250,7 @@ def compute_all_perplexities(
         if jb is None:
             continue
         prompt = prompt_map.get(pid)
-        if not prompt:
+        if not prompt or not isinstance(prompt, str) or not prompt.strip():
             continue
 
         ppl = compute_perplexity(model, tokenizer, prompt, device)
