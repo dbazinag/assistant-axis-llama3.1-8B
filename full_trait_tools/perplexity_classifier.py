@@ -38,6 +38,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+print("USING LOG PPL...")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 JAILBREAKS_URL         = (
