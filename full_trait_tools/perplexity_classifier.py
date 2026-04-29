@@ -3,32 +3,31 @@
 perplexity_classifier.py
 
 Baseline jailbreak detector using Llama-3.1-8B perplexity of the input prompt.
-Trains a logistic regression on perplexity scores from the HarmBench training set,
-then tests on HarmBench held-out, GCG, and PAIR — same regime as fast_transfer_classifier.py.
 
-Perplexity = exp(mean NLL) of the formatted prompt under Llama-3.1-8B.
-High perplexity → prompt looks unusual to the model (e.g. GCG suffix).
-Low perplexity → fluent natural language (PAIR, human jailbreaks).
+KEY DESIGN DECISIONS:
+  - Uses log(perplexity) as feature to handle the massive scale difference
+    between attack families (GCG: ~1000-1500, HarmBench/PAIR: ~50-100)
+  - Reports BOTH:
+      (a) Direct within-dataset AUC — no training, just threshold the score.
+          This is the honest measure of what perplexity can do per family.
+      (b) Cross-family logreg AUC — train on HarmBench, test on GCG/PAIR.
+          Expected to be near-chance due to distribution shift. This is itself
+          the key finding: perplexity requires per-family calibration.
 
-HarmBench formatted prompts are reconstructed from:
-  - pairs_metadata.jsonl (has jailbreak_idx per pair)
-  - jailbreaks.py fetched from HarmBench GitHub (same seed/sample as collection)
-
-GCG/PAIR formatted prompts come from their test_cases.json files.
+Same strict pool split regime as fast_transfer_classifier.py.
 
 Usage:
   uv run python full_trait_tools/perplexity_classifier.py
-  uv run python full_trait_tools/perplexity_classifier.py --test  # 3 behaviors only
+  uv run python full_trait_tools/perplexity_classifier.py --test
 """
 
 import argparse
 import json
 import logging
 import random
-import sys
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -40,13 +39,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Constants (must match collect_harmbench_activations.py) ───────────────────
-JAILBREAKS_URL = (
+# ── Constants ──────────────────────────────────────────────────────────────────
+JAILBREAKS_URL         = (
     "https://raw.githubusercontent.com/centerforaisafety/HarmBench"
     "/main/baselines/human_jailbreaks/jailbreaks.py"
 )
 SKIP_JAILBREAK_INDICES = {16, 44}
-N_JAILBREAK_SAMPLES    = 20
 HARMBENCH_SEED         = 42
 TRAIN_FRAC             = 0.7
 N_SEEDS                = 50
@@ -57,7 +55,6 @@ MODEL_NAME             = "meta-llama/Llama-3.1-8B-Instruct"
 # ── Jailbreak template reconstruction ─────────────────────────────────────────
 
 def fetch_jailbreaks() -> Dict[int, str]:
-    """Fetch and parse jailbreaks.py, return {original_idx: template}."""
     logger.info("Fetching jailbreaks.py from GitHub...")
     with urllib.request.urlopen(JAILBREAKS_URL) as resp:
         source = resp.read().decode("utf-8")
@@ -75,14 +72,6 @@ def fetch_jailbreaks() -> Dict[int, str]:
     return valid
 
 
-def get_sampled_jailbreak_indices(all_indices: List[int]) -> List[int]:
-    """Reproduce the same random sample used during collection."""
-    rng = random.Random(HARMBENCH_SEED)
-    return sorted(rng.sample(all_indices, min(N_JAILBREAK_SAMPLES, len(all_indices))))
-
-
-# ── Data loading ───────────────────────────────────────────────────────────────
-
 def load_jsonl(path: Path) -> List[dict]:
     rows = []
     with open(path, encoding="utf-8") as f:
@@ -98,25 +87,15 @@ def build_harmbench_prompt_map(
     classified_path: Path,
     jailbreak_templates: Dict[int, str],
 ) -> Dict[int, str]:
-    """
-    Reconstruct formatted_prompt for each HarmBench pair_id.
-    Returns {pair_id: formatted_prompt}.
-    """
-    # Load metadata to get jailbreak_idx and behavior_text per pair
     meta_rows = load_jsonl(metadata_path)
     classified_rows = load_jsonl(classified_path)
-
-    # Build behavior_text lookup from classified responses
     behavior_lookup = {r["pair_id"]: r["behavior_text"] for r in classified_rows}
-
     prompt_map = {}
     for row in meta_rows:
         pid = row["pair_id"]
         jb_idx = row["jailbreak_idx"]
         behavior_text = row.get("behavior_text") or behavior_lookup.get(pid, "")
-
         if jb_idx == -1:
-            # DirectRequest — plain behavior text
             prompt_map[pid] = behavior_text
         elif jb_idx in jailbreak_templates:
             try:
@@ -125,22 +104,13 @@ def build_harmbench_prompt_map(
                 prompt_map[pid] = behavior_text
         else:
             prompt_map[pid] = behavior_text
-
     logger.info(f"  Reconstructed {len(prompt_map)} HarmBench prompts")
     return prompt_map
 
 
-def build_gcg_prompt_map(
-    classified_path: Path,
-    test_cases_path: Path,
-) -> Dict[int, str]:
-    """
-    Build {pair_id: formatted_prompt} for GCG.
-    GCG prompt = the adversarial suffix prompt from test_cases.json.
-    """
+def build_gcg_prompt_map(classified_path: Path, test_cases_path: Path) -> Dict[int, str]:
     test_cases = json.load(open(test_cases_path))
     rows = load_jsonl(classified_path)
-
     prompt_map = {}
     for row in rows:
         pid = row["pair_id"]
@@ -148,33 +118,21 @@ def build_gcg_prompt_map(
         if bid in test_cases and test_cases[bid]:
             prompt_map[pid] = test_cases[bid][0]
         else:
-            # Fallback to behavior text if no test case found
             prompt_map[pid] = row.get("behavior_text", "")
     return prompt_map
 
 
-def build_pair_prompt_map(
-    classified_path: Path,
-    test_cases_path: Path,
-) -> Dict[int, str]:
-    """
-    Build {pair_id: formatted_prompt} for PAIR.
-    For PAIR jailbreaks: prompt from test_cases.json.
-    For plain prompts: behavior_text.
-    """
+def build_pair_prompt_map(classified_path: Path, test_cases_path: Path) -> Dict[int, str]:
     test_cases = json.load(open(test_cases_path))
     rows = load_jsonl(classified_path)
-
     prompt_map = {}
     for row in rows:
         pid = row["pair_id"]
         bid = row["behavior_id"]
         attack_type = row.get("attack_type", "")
-
         if attack_type == "PAIR" and bid in test_cases and test_cases[bid]:
             prompt_map[pid] = test_cases[bid][0]
         else:
-            # plain prompt — just behavior text
             prompt_map[pid] = row.get("behavior_text", "")
     return prompt_map
 
@@ -188,17 +146,10 @@ def compute_perplexity(
     device: torch.device,
     max_length: int = 2048,
 ) -> float:
-    """
-    Compute perplexity of `text` under the model.
-    Applies Llama chat template (same as during collection).
-    Returns perplexity as a float (lower = more fluent/natural).
-    """
     try:
-        # Sanitize to remove surrogate characters
         text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         if not text.strip():
             return float("nan")
-        # Apply chat template — same format as collection
         conversation = [{"role": "user", "content": text}]
         formatted = tokenizer.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=True
@@ -212,16 +163,13 @@ def compute_perplexity(
         )
         input_ids = enc["input_ids"].to(device)
         attention_mask = torch.ones_like(input_ids)
-
         with torch.no_grad():
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=input_ids,
             )
-        # outputs.loss = mean NLL per token
         return float(torch.exp(outputs.loss).item())
-
     except Exception as e:
         logger.warning(f"Perplexity error: {e}")
         return float("nan")
@@ -235,16 +183,11 @@ def compute_all_perplexities(
     device: torch.device,
     desc: str = "",
 ) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
-    """
-    Compute perplexity for all rows that have a label and a prompt.
-    Returns (X [N x 1], y [N], valid_rows).
-    """
+    """Returns (X [N x 2], y [N], valid_rows) where X = [log_ppl, ppl]."""
     X_list, y_list, valid_rows = [], [], []
-
     for i, row in enumerate(rows):
         if i % 100 == 0:
             logger.info(f"  {desc} {i}/{len(rows)}")
-
         pid = row["pair_id"]
         jb = row.get("jailbroken")
         if jb is None:
@@ -252,15 +195,13 @@ def compute_all_perplexities(
         prompt = prompt_map.get(pid)
         if not prompt or not isinstance(prompt, str) or not prompt.strip():
             continue
-
         ppl = compute_perplexity(model, tokenizer, prompt, device)
-        if np.isnan(ppl):
+        if np.isnan(ppl) or np.isinf(ppl):
             continue
-
-        X_list.append([ppl])
+        log_ppl = float(np.log(ppl + 1e-8))
+        X_list.append([log_ppl, ppl])
         y_list.append(1 if jb else 0)
         valid_rows.append(row)
-
     if not X_list:
         return np.array([]), np.array([]), []
     return np.stack(X_list), np.array(y_list), valid_rows
@@ -276,11 +217,8 @@ def get_pool_split(rows, train_frac, seed):
     rng.shuffle(all_templates)
     n_beh = max(1, int(len(all_behaviors) * train_frac))
     n_tpl = max(1, int(len(all_templates) * train_frac))
-    train_beh = set(all_behaviors[:n_beh])
-    train_tpl = set(all_templates[:n_tpl])
-    test_beh  = set(all_behaviors[n_beh:])
-    test_tpl  = set(all_templates[n_tpl:])
-    return train_beh, train_tpl, test_beh, test_tpl
+    return (set(all_behaviors[:n_beh]), set(all_templates[:n_tpl]),
+            set(all_behaviors[n_beh:]),  set(all_templates[n_tpl:]))
 
 
 def split_by_pool(rows, train_beh, train_tpl, test_beh, test_tpl):
@@ -291,16 +229,32 @@ def split_by_pool(rows, train_beh, train_tpl, test_beh, test_tpl):
     return train_idx, test_idx
 
 
-def fit_eval(X_tr, y_tr, X_te, y_te):
+def fit_eval_logreg(X_tr, y_tr, X_te, y_te):
+    """Logistic regression: train on HarmBench, test on target."""
+    if len(set(y_te)) < 2:
+        return float("nan")
     scaler = StandardScaler()
     X_tr_s = scaler.fit_transform(X_tr)
     X_te_s = scaler.transform(X_te)
     clf = LogisticRegression(max_iter=2000, random_state=RANDOM_SEED, C=1.0)
     clf.fit(X_tr_s, y_tr)
-    if len(set(y_te)) < 2:
-        return float("nan")
     probs = clf.predict_proba(X_te_s)[:, 1]
     return float(roc_auc_score(y_te, probs))
+
+
+def direct_auc(X, y, feature_idx=0):
+    """
+    Direct AUC: use log_ppl score directly as classifier (no training).
+    Higher perplexity → more likely jailbroken.
+    We try both directions and return the better one (since within HarmBench
+    jailbroken prompts are actually slightly lower perplexity).
+    """
+    if len(set(y)) < 2 or len(X) == 0:
+        return float("nan"), float("nan")
+    scores = X[:, feature_idx]
+    auc_pos = float(roc_auc_score(y, scores))
+    auc_neg = float(roc_auc_score(y, -scores))
+    return max(auc_pos, auc_neg), auc_pos  # (best_auc, raw_auc)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -317,7 +271,7 @@ def main():
     parser.add_argument("--model",                 default=MODEL_NAME)
     parser.add_argument("--n_seeds",  type=int,    default=N_SEEDS)
     parser.add_argument("--device",                default="cuda")
-    parser.add_argument("--test",     action="store_true", help="First 3 behaviors only")
+    parser.add_argument("--test",     action="store_true")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -341,20 +295,10 @@ def main():
     # ── Reconstruct prompts ────────────────────────────────────────────────────
     logger.info("\n=== Reconstructing prompts ===")
     jailbreak_templates = fetch_jailbreaks()
-
     human_prompt_map = build_harmbench_prompt_map(
-        Path(args.human_metadata_path),
-        Path(args.human_classified_path),
-        jailbreak_templates,
-    )
-    gcg_prompt_map  = build_gcg_prompt_map(
-        Path(args.gcg_classified_path),
-        Path(args.gcg_test_cases_path),
-    )
-    pair_prompt_map = build_pair_prompt_map(
-        Path(args.pair_classified_path),
-        Path(args.pair_test_cases_path),
-    )
+        Path(args.human_metadata_path), Path(args.human_classified_path), jailbreak_templates)
+    gcg_prompt_map  = build_gcg_prompt_map(Path(args.gcg_classified_path),  Path(args.gcg_test_cases_path))
+    pair_prompt_map = build_pair_prompt_map(Path(args.pair_classified_path), Path(args.pair_test_cases_path))
 
     # ── Load metadata ──────────────────────────────────────────────────────────
     logger.info("\n=== Loading metadata ===")
@@ -371,60 +315,52 @@ def main():
 
     # ── Compute perplexities ───────────────────────────────────────────────────
     logger.info("\n=== Computing perplexities ===")
-
-    logger.info("HarmBench human jailbreaks...")
+    logger.info("HarmBench...")
     X_human, y_human, human_valid = compute_all_perplexities(
-        human_rows, human_prompt_map, model, tokenizer, device, "HarmBench"
-    )
-    logger.info(f"  {len(y_human)} pairs, {y_human.sum():.0f} jailbroken")
-
+        human_rows, human_prompt_map, model, tokenizer, device, "HarmBench")
     logger.info("GCG...")
-    X_gcg, y_gcg, gcg_valid = compute_all_perplexities(
-        gcg_rows, gcg_prompt_map, model, tokenizer, device, "GCG"
-    )
-    logger.info(f"  {len(y_gcg)} pairs, {y_gcg.sum():.0f} jailbroken")
-
+    X_gcg, y_gcg, _ = compute_all_perplexities(
+        gcg_rows, gcg_prompt_map, model, tokenizer, device, "GCG")
     logger.info("PAIR...")
-    X_pair, y_pair, pair_valid = compute_all_perplexities(
-        pair_rows, pair_prompt_map, model, tokenizer, device, "PAIR"
-    )
-    logger.info(f"  {len(y_pair)} pairs, {y_pair.sum():.0f} jailbroken")
+    X_pair, y_pair, _ = compute_all_perplexities(
+        pair_rows, pair_prompt_map, model, tokenizer, device, "PAIR")
 
-    # Save perplexities for inspection
-    ppl_out = {
-        "human_ppl_mean": float(X_human.mean()) if len(X_human) else None,
-        "gcg_ppl_mean":   float(X_gcg.mean())   if len(X_gcg) else None,
-        "pair_ppl_mean":  float(X_pair.mean())  if len(X_pair) else None,
-        "human_ppl_jb_mean":  float(X_human[y_human==1].mean()) if y_human.sum() > 0 else None,
-        "human_ppl_nojb_mean": float(X_human[y_human==0].mean()) if (y_human==0).sum() > 0 else None,
-        "gcg_ppl_jb_mean":    float(X_gcg[y_gcg==1].mean()) if y_gcg.sum() > 0 else None,
-        "gcg_ppl_nojb_mean":  float(X_gcg[y_gcg==0].mean()) if (y_gcg==0).sum() > 0 else None,
-        "pair_ppl_jb_mean":   float(X_pair[y_pair==1].mean()) if y_pair.sum() > 0 else None,
-        "pair_ppl_nojb_mean": float(X_pair[y_pair==0].mean()) if (y_pair==0).sum() > 0 else None,
-    }
-    logger.info(f"\nPerplexity summary: {json.dumps(ppl_out, indent=2)}")
+    # Log perplexity stats
+    def ppl_stats(X, y, name):
+        if len(X) == 0: return
+        ppl = np.exp(X[:, 0])  # X[:,0] is log_ppl
+        jb = y == 1
+        logger.info(f"  {name}: mean={ppl.mean():.1f}, jb={ppl[jb].mean():.1f}, no_jb={ppl[~jb].mean():.1f}")
+    ppl_stats(X_human, y_human, "HarmBench")
+    ppl_stats(X_gcg,   y_gcg,   "GCG")
+    ppl_stats(X_pair,  y_pair,  "PAIR")
 
-    # ── Multi-seed classification ──────────────────────────────────────────────
-    logger.info(f"\n=== Classification ({args.n_seeds} seeds) ===")
+    # ── Direct AUC (no training) ───────────────────────────────────────────────
+    logger.info("\n=== Direct AUC (no logreg, threshold log_ppl directly) ===")
+    direct_human_best, direct_human_raw = direct_auc(X_human, y_human)
+    direct_gcg_best,   direct_gcg_raw   = direct_auc(X_gcg,   y_gcg)
+    direct_pair_best,  direct_pair_raw  = direct_auc(X_pair,  y_pair)
+    logger.info(f"  HarmBench: {direct_human_best:.4f} (raw: {direct_human_raw:.4f})")
+    logger.info(f"  GCG:       {direct_gcg_best:.4f}   (raw: {direct_gcg_raw:.4f})")
+    logger.info(f"  PAIR:      {direct_pair_best:.4f}  (raw: {direct_pair_raw:.4f})")
 
+    # ── Cross-family logreg (train HarmBench → test GCG/PAIR) ─────────────────
+    logger.info(f"\n=== Cross-family logreg ({args.n_seeds} seeds) ===")
     gcg_aucs, pair_aucs, human_test_aucs = [], [], []
 
     for seed in range(args.n_seeds):
-        train_beh, train_tpl, test_beh, test_tpl = get_pool_split(
-            human_valid, TRAIN_FRAC, seed
-        )
-        train_idx, test_idx = split_by_pool(
-            human_valid, train_beh, train_tpl, test_beh, test_tpl
-        )
+        train_beh, train_tpl, test_beh, test_tpl = get_pool_split(human_valid, TRAIN_FRAC, seed)
+        train_idx, test_idx = split_by_pool(human_valid, train_beh, train_tpl, test_beh, test_tpl)
         if len(train_idx) == 0 or len(test_idx) == 0:
             continue
 
-        X_tr = X_human[train_idx]; y_tr = y_human[train_idx]
-        X_te = X_human[test_idx];  y_te = y_human[test_idx]
+        # Use only log_ppl column (index 0) — more stable across families than raw ppl
+        X_tr = X_human[train_idx, :1]; y_tr = y_human[train_idx]
+        X_te = X_human[test_idx,  :1]; y_te = y_human[test_idx]
 
-        gcg_aucs.append(fit_eval(X_tr, y_tr, X_gcg,  y_gcg))
-        pair_aucs.append(fit_eval(X_tr, y_tr, X_pair, y_pair))
-        human_test_aucs.append(fit_eval(X_tr, y_tr, X_te, y_te))
+        gcg_aucs.append(fit_eval_logreg(X_tr, y_tr, X_gcg[:, :1],  y_gcg))
+        pair_aucs.append(fit_eval_logreg(X_tr, y_tr, X_pair[:, :1], y_pair))
+        human_test_aucs.append(fit_eval_logreg(X_tr, y_tr, X_te, y_te))
 
         if seed % 10 == 0:
             logger.info(f"  Seed {seed} done")
@@ -432,35 +368,39 @@ def main():
     # ── Summary ────────────────────────────────────────────────────────────────
     sep = "=" * 80
     print(f"\n{sep}")
-    print(f"  PERPLEXITY BASELINE  |  Llama-3.1-8B  |  {args.n_seeds} seeds")
+    print(f"  PERPLEXITY BASELINE  |  Llama-3.1-8B log(ppl)  |  {args.n_seeds} seeds")
     print(sep)
-    print(f"\n  {'Metric':30s}  {'Mean':>8}  {'Std':>8}")
+    print(f"\n  DIRECT AUC (within-dataset, no training):")
+    print(f"  {'HarmBench':30s}  {direct_human_best:>8.4f}")
+    print(f"  {'GCG':30s}  {direct_gcg_best:>8.4f}")
+    print(f"  {'PAIR':30s}  {direct_pair_best:>8.4f}")
+    print(f"\n  CROSS-FAMILY LOGREG (train HarmBench → test *):")
+    print(f"  {'Metric':30s}  {'Mean':>8}  {'Std':>8}")
     print("  " + "─" * 50)
-    print(f"  {'→ HarmBench test AUC':30s}  {np.mean(human_test_aucs):>8.4f}  {np.std(human_test_aucs):>8.4f}")
-    print(f"  {'→ GCG transfer AUC':30s}  {np.mean(gcg_aucs):>8.4f}  {np.std(gcg_aucs):>8.4f}")
-    print(f"  {'→ PAIR transfer AUC':30s}  {np.mean(pair_aucs):>8.4f}  {np.std(pair_aucs):>8.4f}")
+    print(f"  {'→ HarmBench test':30s}  {np.mean(human_test_aucs):>8.4f}  {np.std(human_test_aucs):>8.4f}")
+    print(f"  {'→ GCG transfer':30s}  {np.mean(gcg_aucs):>8.4f}  {np.std(gcg_aucs):>8.4f}")
+    print(f"  {'→ PAIR transfer':30s}  {np.mean(pair_aucs):>8.4f}  {np.std(pair_aucs):>8.4f}")
     print(f"\n  GCG chance:  {y_gcg.mean():.4f}")
     print(f"  PAIR chance: {y_pair.mean():.4f}")
-    print(f"\n  Perplexity means:")
-    print(f"    HarmBench jailbroken:     {ppl_out['human_ppl_jb_mean']:.2f}")
-    print(f"    HarmBench not jailbroken: {ppl_out['human_ppl_nojb_mean']:.2f}")
-    print(f"    GCG jailbroken:           {ppl_out['gcg_ppl_jb_mean']:.2f}")
-    print(f"    GCG not jailbroken:       {ppl_out['gcg_ppl_nojb_mean']:.2f}")
-    print(f"    PAIR jailbroken:          {ppl_out['pair_ppl_jb_mean']:.2f}")
-    print(f"    PAIR not jailbroken:      {ppl_out['pair_ppl_nojb_mean']:.2f}")
     print(sep)
+    print("\n  NOTE: Cross-family logreg failure is expected and is itself")
+    print("  a finding — perplexity requires per-family calibration.")
+    print("  Use DIRECT AUC for honest within-family comparison.")
 
-    # Save results
     out = {
         "model": args.model,
         "n_seeds": args.n_seeds,
-        "gcg_chance": float(y_gcg.mean()),
+        "gcg_chance":  float(y_gcg.mean()),
         "pair_chance": float(y_pair.mean()),
-        "perplexity_stats": ppl_out,
-        "results": {
-            "human_test": {"mean": float(np.mean(human_test_aucs)), "std": float(np.std(human_test_aucs)), "all": human_test_aucs},
-            "transfer_gcg":  {"mean": float(np.mean(gcg_aucs)),  "std": float(np.std(gcg_aucs)),  "all": gcg_aucs},
-            "transfer_pair": {"mean": float(np.mean(pair_aucs)), "std": float(np.std(pair_aucs)), "all": pair_aucs},
+        "direct_auc": {
+            "human": {"best": direct_human_best, "raw": direct_human_raw},
+            "gcg":   {"best": direct_gcg_best,   "raw": direct_gcg_raw},
+            "pair":  {"best": direct_pair_best,  "raw": direct_pair_raw},
+        },
+        "cross_family_logreg": {
+            "human_test": {"mean": float(np.mean(human_test_aucs)), "std": float(np.std(human_test_aucs))},
+            "transfer_gcg":  {"mean": float(np.mean(gcg_aucs)),  "std": float(np.std(gcg_aucs))},
+            "transfer_pair": {"mean": float(np.mean(pair_aucs)), "std": float(np.std(pair_aucs))},
         }
     }
     out_path = output_dir / "perplexity_results.json"
