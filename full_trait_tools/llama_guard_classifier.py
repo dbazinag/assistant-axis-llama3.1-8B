@@ -139,14 +139,21 @@ def build_pair_prompt_map(classified_path: Path, test_cases_path: Path) -> Dict[
 
 # ── Llama Guard scoring ────────────────────────────────────────────────────────
 
-def build_guard_prompt(tokenizer, user_message: str) -> str:
+def build_guard_prompt(tokenizer, user_message: str, assistant_response: str = None) -> str:
     """
     Format prompt using Llama Guard's chat template.
-    Guard expects a conversation with role "user".
+    If assistant_response provided, evaluates the response (correct mode).
+    If not, evaluates the prompt only (prompt-only mode).
     """
-    conversation = [{"role": "user", "content": user_message}]
+    if assistant_response:
+        conversation = [
+            {"role": "user",      "content": user_message},
+            {"role": "assistant", "content": assistant_response},
+        ]
+    else:
+        conversation = [{"role": "user", "content": user_message}]
     return tokenizer.apply_chat_template(
-        conversation, tokenize=False, add_generation_prompt=True
+        conversation, tokenize=False, add_generation_prompt=False
     )
 
 
@@ -157,17 +164,19 @@ def get_unsafe_score(
     device: torch.device,
     safe_token_id: int,
     unsafe_token_id: int,
+    assistant_response: str = None,
 ) -> float:
     """
     Returns P(unsafe) as a soft detection score in [0, 1].
-    Higher = more likely to be flagged as unsafe by Llama Guard.
+    Uses prompt + response mode when assistant_response is provided
+    (evaluates whether the agent's response is unsafe — correct for your task).
     """
     try:
         prompt_text = prompt_text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         if not prompt_text.strip():
             return float("nan")
 
-        guard_input = build_guard_prompt(tokenizer, prompt_text)
+        guard_input = build_guard_prompt(tokenizer, prompt_text, assistant_response)
         enc = tokenizer(
             guard_input,
             return_tensors="pt",
@@ -216,8 +225,14 @@ def compute_all_scores(
     safe_token_id: int,
     unsafe_token_id: int,
     desc: str = "",
-) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
-    X_list, y_list, valid_rows = [], [], []
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[dict]]:
+    """
+    Compute Llama Guard scores in a single pass, both modes:
+      X_input  [N x 1] — input-only mode (prompt only, pre-generation)
+      X_full   [N x 1] — input+output mode (prompt + model response)
+    Returns (X_input, X_full, y, valid_rows).
+    """
+    X_input_list, X_full_list, y_list, valid_rows = [], [], [], []
 
     for i, row in enumerate(rows):
         if i % 100 == 0:
@@ -231,19 +246,32 @@ def compute_all_scores(
         if not prompt or not isinstance(prompt, str) or not prompt.strip():
             continue
 
-        score = get_unsafe_score(
-            model, tokenizer, prompt, device, safe_token_id, unsafe_token_id
+        # Input-only score (pre-generation, same setting as activation classifier)
+        score_input = get_unsafe_score(
+            model, tokenizer, prompt, device, safe_token_id, unsafe_token_id,
+            assistant_response=None,
         )
-        if np.isnan(score):
+
+        # Input+output score (post-generation, easier task)
+        response_text = row.get("response_text", None)
+        if response_text and not response_text.strip():
+            response_text = None
+        score_full = get_unsafe_score(
+            model, tokenizer, prompt, device, safe_token_id, unsafe_token_id,
+            assistant_response=response_text,
+        )
+
+        if np.isnan(score_input) or np.isnan(score_full):
             continue
 
-        X_list.append([score])
+        X_input_list.append([score_input])
+        X_full_list.append([score_full])
         y_list.append(1 if jb else 0)
         valid_rows.append(row)
 
-    if not X_list:
-        return np.array([]), np.array([]), []
-    return np.stack(X_list), np.array(y_list), valid_rows
+    if not X_input_list:
+        return np.array([]), np.array([]), np.array([]), []
+    return np.stack(X_input_list), np.stack(X_full_list), np.array(y_list), valid_rows
 
 
 # ── Pool split (identical to fast_transfer_classifier.py) ─────────────────────
@@ -350,40 +378,52 @@ def main():
         pair_rows  = pair_rows[:20]
 
     # ── Compute scores ─────────────────────────────────────────────────────────
-    logger.info("\n=== Computing Llama Guard scores ===")
+    logger.info("\n=== Computing Llama Guard scores (both modes, single pass) ===")
 
     logger.info("HarmBench...")
-    X_human, y_human, human_valid = compute_all_scores(
+    X_human_input, X_human_full, y_human, human_valid = compute_all_scores(
         human_rows, human_prompt_map, model, tokenizer, device,
         safe_token_id, unsafe_token_id, "HarmBench"
     )
     logger.info(f"  {len(y_human)} pairs, {y_human.sum():.0f} jailbroken")
-    logger.info(f"  Mean unsafe score — jailbroken: {X_human[y_human==1].mean():.3f}, not: {X_human[y_human==0].mean():.3f}")
 
     logger.info("GCG...")
-    X_gcg, y_gcg, gcg_valid = compute_all_scores(
+    X_gcg_input, X_gcg_full, y_gcg, _ = compute_all_scores(
         gcg_rows, gcg_prompt_map, model, tokenizer, device,
         safe_token_id, unsafe_token_id, "GCG"
     )
     logger.info(f"  {len(y_gcg)} pairs, {y_gcg.sum():.0f} jailbroken")
 
     logger.info("PAIR...")
-    X_pair, y_pair, pair_valid = compute_all_scores(
+    X_pair_input, X_pair_full, y_pair, _ = compute_all_scores(
         pair_rows, pair_prompt_map, model, tokenizer, device,
         safe_token_id, unsafe_token_id, "PAIR"
     )
     logger.info(f"  {len(y_pair)} pairs, {y_pair.sum():.0f} jailbroken")
 
-    # Direct AUC without logistic regression (score is already a probability)
-    direct_gcg_auc  = roc_auc_score(y_gcg,  X_gcg[:,0])  if len(set(y_gcg))  > 1 else float("nan")
-    direct_pair_auc = roc_auc_score(y_pair, X_pair[:,0]) if len(set(y_pair)) > 1 else float("nan")
-    direct_human_auc = roc_auc_score(y_human, X_human[:,0]) if len(set(y_human)) > 1 else float("nan")
-    logger.info(f"\n  Direct AUC (no logreg) — Human: {direct_human_auc:.4f}, GCG: {direct_gcg_auc:.4f}, PAIR: {direct_pair_auc:.4f}")
+    def best_auc(X, y):
+        if len(set(y)) < 2 or len(X) == 0: return float("nan")
+        a = roc_auc_score(y, X[:,0])
+        return max(a, 1 - a)
+
+    # Direct AUC — input only
+    direct_human_input = best_auc(X_human_input, y_human)
+    direct_gcg_input   = best_auc(X_gcg_input,   y_gcg)
+    direct_pair_input  = best_auc(X_pair_input,  y_pair)
+
+    # Direct AUC — input + output
+    direct_human_full  = best_auc(X_human_full, y_human)
+    direct_gcg_full    = best_auc(X_gcg_full,   y_gcg)
+    direct_pair_full   = best_auc(X_pair_full,  y_pair)
+
+    logger.info(f"\n  Direct AUC input-only  — Human: {direct_human_input:.4f}, GCG: {direct_gcg_input:.4f}, PAIR: {direct_pair_input:.4f}")
+    logger.info(f"  Direct AUC input+output — Human: {direct_human_full:.4f}, GCG: {direct_gcg_full:.4f}, PAIR: {direct_pair_full:.4f}")
 
     # ── Multi-seed classification ──────────────────────────────────────────────
     logger.info(f"\n=== Classification ({args.n_seeds} seeds) ===")
 
-    gcg_aucs, pair_aucs, human_test_aucs = [], [], []
+    gcg_aucs_input, pair_aucs_input, human_test_aucs_input = [], [], []
+    gcg_aucs_full,  pair_aucs_full,  human_test_aucs_full  = [], [], []
 
     for seed in range(args.n_seeds):
         train_beh, train_tpl, test_beh, test_tpl = get_pool_split(
@@ -395,30 +435,43 @@ def main():
         if len(train_idx) == 0 or len(test_idx) == 0:
             continue
 
-        X_tr = X_human[train_idx]; y_tr = y_human[train_idx]
-        X_te = X_human[test_idx];  y_te = y_human[test_idx]
+        # Input-only mode
+        X_tr_i = X_human_input[train_idx]; y_tr = y_human[train_idx]
+        X_te_i = X_human_input[test_idx];  y_te = y_human[test_idx]
+        gcg_aucs_input.append(fit_eval(X_tr_i, y_tr, X_gcg_input,  y_gcg))
+        pair_aucs_input.append(fit_eval(X_tr_i, y_tr, X_pair_input, y_pair))
+        human_test_aucs_input.append(fit_eval(X_tr_i, y_tr, X_te_i, y_te))
 
-        gcg_aucs.append(fit_eval(X_tr, y_tr, X_gcg,  y_gcg))
-        pair_aucs.append(fit_eval(X_tr, y_tr, X_pair, y_pair))
-        human_test_aucs.append(fit_eval(X_tr, y_tr, X_te, y_te))
+        # Input+output mode
+        X_tr_f = X_human_full[train_idx]
+        X_te_f = X_human_full[test_idx]
+        gcg_aucs_full.append(fit_eval(X_tr_f, y_tr, X_gcg_full,  y_gcg))
+        pair_aucs_full.append(fit_eval(X_tr_f, y_tr, X_pair_full, y_pair))
+        human_test_aucs_full.append(fit_eval(X_tr_f, y_tr, X_te_f, y_te))
 
         if seed % 10 == 0:
             logger.info(f"  Seed {seed} done")
 
     # ── Summary ────────────────────────────────────────────────────────────────
-    sep = "=" * 80
+    sep = "=" * 90
     print(f"\n{sep}")
-    print(f"  LLAMA GUARD 3 BASELINE  |  {args.guard_model}  |  {args.n_seeds} seeds")
+    print(f"  LLAMA GUARD 3  |  {args.guard_model}  |  {args.n_seeds} seeds")
     print(sep)
-    print(f"\n  {'Metric':35s}  {'Mean':>8}  {'Std':>8}")
-    print("  " + "─" * 55)
-    print(f"  {'→ HarmBench test AUC (logreg)':35s}  {np.mean(human_test_aucs):>8.4f}  {np.std(human_test_aucs):>8.4f}")
-    print(f"  {'→ GCG transfer AUC (logreg)':35s}  {np.mean(gcg_aucs):>8.4f}  {np.std(gcg_aucs):>8.4f}")
-    print(f"  {'→ PAIR transfer AUC (logreg)':35s}  {np.mean(pair_aucs):>8.4f}  {np.std(pair_aucs):>8.4f}")
-    print(f"\n  Direct AUC (raw P(unsafe) score, no logreg):")
-    print(f"  {'→ HarmBench direct AUC':35s}  {direct_human_auc:>8.4f}")
-    print(f"  {'→ GCG direct AUC':35s}  {direct_gcg_auc:>8.4f}")
-    print(f"  {'→ PAIR direct AUC':35s}  {direct_pair_auc:>8.4f}")
+
+    print(f"\n  INPUT-ONLY MODE (pre-generation, same setting as activation classifier)")
+    print(f"  {'Metric':35s}  {'Direct AUC':>10}  {'Logreg mean':>12}  {'Logreg std':>11}")
+    print("  " + "─" * 72)
+    print(f"  {'HarmBench':35s}  {direct_human_input:>10.4f}  {np.mean(human_test_aucs_input):>12.4f}  {np.std(human_test_aucs_input):>11.4f}")
+    print(f"  {'→ GCG transfer':35s}  {direct_gcg_input:>10.4f}  {np.mean(gcg_aucs_input):>12.4f}  {np.std(gcg_aucs_input):>11.4f}")
+    print(f"  {'→ PAIR transfer':35s}  {direct_pair_input:>10.4f}  {np.mean(pair_aucs_input):>12.4f}  {np.std(pair_aucs_input):>11.4f}")
+
+    print(f"\n  INPUT+OUTPUT MODE (post-generation, sees model response)")
+    print(f"  {'Metric':35s}  {'Direct AUC':>10}  {'Logreg mean':>12}  {'Logreg std':>11}")
+    print("  " + "─" * 72)
+    print(f"  {'HarmBench':35s}  {direct_human_full:>10.4f}  {np.mean(human_test_aucs_full):>12.4f}  {np.std(human_test_aucs_full):>11.4f}")
+    print(f"  {'→ GCG transfer':35s}  {direct_gcg_full:>10.4f}  {np.mean(gcg_aucs_full):>12.4f}  {np.std(gcg_aucs_full):>11.4f}")
+    print(f"  {'→ PAIR transfer':35s}  {direct_pair_full:>10.4f}  {np.mean(pair_aucs_full):>12.4f}  {np.std(pair_aucs_full):>11.4f}")
+
     print(f"\n  GCG chance:  {y_gcg.mean():.4f}")
     print(f"  PAIR chance: {y_pair.mean():.4f}")
     print(sep)
@@ -428,16 +481,22 @@ def main():
         "n_seeds": args.n_seeds,
         "gcg_chance":  float(y_gcg.mean()),
         "pair_chance": float(y_pair.mean()),
-        "direct_auc": {
-            "human": direct_human_auc,
-            "gcg":   direct_gcg_auc,
-            "pair":  direct_pair_auc,
+        "input_only": {
+            "direct_auc": {"human": direct_human_input, "gcg": direct_gcg_input, "pair": direct_pair_input},
+            "logreg": {
+                "human_test":    {"mean": float(np.mean(human_test_aucs_input)), "std": float(np.std(human_test_aucs_input))},
+                "transfer_gcg":  {"mean": float(np.mean(gcg_aucs_input)),        "std": float(np.std(gcg_aucs_input))},
+                "transfer_pair": {"mean": float(np.mean(pair_aucs_input)),       "std": float(np.std(pair_aucs_input))},
+            },
         },
-        "logreg_results": {
-            "human_test": {"mean": float(np.mean(human_test_aucs)), "std": float(np.std(human_test_aucs)), "all": human_test_aucs},
-            "transfer_gcg":  {"mean": float(np.mean(gcg_aucs)),  "std": float(np.std(gcg_aucs)),  "all": gcg_aucs},
-            "transfer_pair": {"mean": float(np.mean(pair_aucs)), "std": float(np.std(pair_aucs)), "all": pair_aucs},
-        }
+        "input_output": {
+            "direct_auc": {"human": direct_human_full, "gcg": direct_gcg_full, "pair": direct_pair_full},
+            "logreg": {
+                "human_test":    {"mean": float(np.mean(human_test_aucs_full)), "std": float(np.std(human_test_aucs_full))},
+                "transfer_gcg":  {"mean": float(np.mean(gcg_aucs_full)),        "std": float(np.std(gcg_aucs_full))},
+                "transfer_pair": {"mean": float(np.mean(pair_aucs_full)),       "std": float(np.std(pair_aucs_full))},
+            },
+        },
     }
     out_path = output_dir / "llama_guard_results.json"
     with open(out_path, "w") as f:
