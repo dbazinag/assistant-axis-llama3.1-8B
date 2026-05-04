@@ -81,18 +81,27 @@ def build_pairs(test_cases, behaviors, attack_type):
             skipped += 1
             continue
         bv = behaviors[behavior_id]
-        for prompt in prompts:
+
+        # Flatten nested lists — PAP saves [[p1, p2, p3]] instead of [p1, p2, p3]
+        flat_prompts = []
+        for p in prompts:
+            if isinstance(p, list):
+                flat_prompts.extend(p)
+            elif isinstance(p, str):
+                flat_prompts.append(p)
+
+        for prompt in flat_prompts:
             if not prompt or not isinstance(prompt, str) or not prompt.strip():
                 continue
             pairs.append({
-                "pair_id":           pair_id,
-                "behavior_id":       behavior_id,
-                "behavior_text":     bv["Behavior"],
-                "semantic_category": bv.get("SemanticCategory", ""),
+                "pair_id":             pair_id,
+                "behavior_id":         behavior_id,
+                "behavior_text":       bv["Behavior"],
+                "semantic_category":   bv.get("SemanticCategory", ""),
                 "functional_category": bv.get("FunctionalCategory", ""),
-                "attack_type":       attack_type,
-                "jailbreak_idx":     -1,
-                "formatted_prompt":  prompt,
+                "attack_type":         attack_type,
+                "jailbreak_idx":       -1,
+                "formatted_prompt":    prompt,
             })
             pair_id += 1
     if skipped:
