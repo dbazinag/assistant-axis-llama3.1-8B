@@ -2,19 +2,19 @@
 """
 run_baselines_gradsafe.py
 
-Runs GradSafe on all attack families using the full HarmBench training split
-as reference gradients. Reports balanced direct AUC (50/50 test set).
+Full GradSafe implementation (Xie et al., ACL 2024) with proper safety-critical
+parameter selection and strict train/calibration/test splits.
 
-GradSafe: cosine similarity between gradient of loss on "Sure, here is"
-given candidate prompt, vs reference gradients from known jailbreak/benign prompts.
+Data splits (all from HarmBench strict pool split, seed=0):
+  - Calibration set (first 50% of train): used to identify safety-critical parameters
+    via gradient norm accumulation across known jailbreak prompts
+  - Reference set (second 50% of train): used to compute jailbreak/benign reference
+    gradient vectors for cosine similarity scoring
+  - Test set (held-out pool split): HarmBench evaluation
+  - Transfer sets: GCG, PAIR, PAP, GPTFuzz, PEZ (no overlap with any train data)
 
-Reference set: full HarmBench strict pool split training rows (seed 0).
-This matches the training set size used by our activation classifier.
-
-Attack families: HarmBench (held-out), GCG, PAIR, PAP, GPTFuzz, PEZ
-
-WARNING: Very slow (~7s per prompt per backward pass).
-Expected runtime: ~3h reference + ~5h scoring = ~8h total.
+Parameter selection: top-k parameters by accumulated squared gradient norm
+across calibration jailbreak prompts (top 20% of last 16 MLP layers).
 
 Usage:
   uv run python full_trait_tools/run_baselines_gradsafe.py
@@ -39,9 +39,10 @@ logger = logging.getLogger(__name__)
 
 MODEL_NAME             = "meta-llama/Llama-3.1-8B-Instruct"
 COMPLIANCE_TARGET      = "Sure, here is"
-GRAD_LAYERS            = list(range(28, 32))   # last 4 MLP layers
 TRAIN_FRAC             = 0.7
 RANDOM_SEED            = 42
+TOP_PARAM_FRAC         = 0.20
+CANDIDATE_LAYERS       = list(range(16, 32))
 JAILBREAKS_URL         = ("https://raw.githubusercontent.com/centerforaisafety/HarmBench"
                           "/main/baselines/human_jailbreaks/jailbreaks.py")
 SKIP_JAILBREAK_INDICES = {16, 44}
@@ -149,7 +150,7 @@ def build_prompt_map_generic(responses, test_cases_path):
     return pm
 
 
-# ── Pool split (strict, same as classifier) ────────────────────────────────────
+# ── Pool split ─────────────────────────────────────────────────────────────────
 
 def get_pool_split(rows, train_frac, seed):
     rng = random.Random(seed)
@@ -168,14 +169,76 @@ def get_pool_split(rows, train_frac, seed):
 
 # ── GradSafe core ──────────────────────────────────────────────────────────────
 
-def get_target_params(model):
+def get_candidate_params(model):
     params = []
-    for layer_idx in GRAD_LAYERS:
+    for layer_idx in CANDIDATE_LAYERS:
         layer = model.model.layers[layer_idx]
-        for _, param in layer.mlp.named_parameters():
+        for name, param in layer.mlp.named_parameters():
             if param.requires_grad:
-                params.append(param)
+                params.append((f"layer{layer_idx}.{name}", param))
+    total = sum(p.numel() for _, p in params)
+    logger.info(f"  Candidate params: {len(params)} tensors, {total:,} total dims")
     return params
+
+
+def accumulate_gradient_norms(model, tokenizer, prompts, candidate_params, device):
+    norm_accum = {name: 0.0 for name, _ in candidate_params}
+    n_ok = 0
+    for i, prompt in enumerate(prompts):
+        if i % 10 == 0:
+            logger.info(f"    Calibration {i}/{len(prompts)}")
+        try:
+            prompt = prompt.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+            if not prompt.strip():
+                continue
+            conversation = [{"role": "user", "content": prompt}]
+            formatted  = tokenizer.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True)
+            full_text  = formatted + COMPLIANCE_TARGET
+            full_enc   = tokenizer(full_text, return_tensors="pt",
+                                   add_special_tokens=False).input_ids.to(device)
+            prompt_enc = tokenizer(formatted, return_tensors="pt",
+                                   add_special_tokens=False).input_ids.to(device)
+            prompt_len = prompt_enc.shape[1]
+            if full_enc.shape[1] <= prompt_len:
+                continue
+            labels = full_enc.clone()
+            labels[0, :prompt_len] = -100
+            attn = torch.ones_like(full_enc)
+            model.zero_grad()
+            outputs = model(input_ids=full_enc, attention_mask=attn, labels=labels)
+            outputs.loss.backward()
+            for name, param in candidate_params:
+                if param.grad is not None:
+                    norm_accum[name] += float(
+                        param.grad.detach().float().pow(2).sum().cpu())
+            model.zero_grad()
+            torch.cuda.empty_cache()
+            n_ok += 1
+        except Exception as e:
+            logger.warning(f"Calibration error {i}: {e}")
+            model.zero_grad()
+            torch.cuda.empty_cache()
+    logger.info(f"  Accumulated norms over {n_ok} prompts")
+    return norm_accum
+
+
+def select_safety_critical_params(norm_accum, candidate_params, top_frac):
+    sorted_names = sorted(norm_accum.keys(), key=lambda n: norm_accum[n], reverse=True)
+    n_select = max(1, int(len(sorted_names) * top_frac))
+    selected_names = set(sorted_names[:n_select])
+    selected = [(name, param) for name, param in candidate_params
+                if name in selected_names]
+    total_dims = sum(p.numel() for _, p in selected)
+    logger.info(f"  Selected {len(selected)} params ({total_dims:,} dims) "
+                f"— top {top_frac:.0%} by gradient norm")
+    layer_counts = {}
+    for name, _ in selected:
+        layer = name.split('.')[0]
+        layer_counts[layer] = layer_counts.get(layer, 0) + 1
+    top_layers = sorted(layer_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    logger.info(f"  Dominant layers: {top_layers}")
+    return selected
 
 
 def compute_gradient_vector(model, tokenizer, prompt_text, target_params, device):
@@ -184,42 +247,35 @@ def compute_gradient_vector(model, tokenizer, prompt_text, target_params, device
         if not prompt_text.strip():
             return None
         conversation = [{"role": "user", "content": prompt_text}]
-        formatted = tokenizer.apply_chat_template(
+        formatted  = tokenizer.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=True)
-        full_text = formatted + COMPLIANCE_TARGET
-
-        full_enc  = tokenizer(full_text, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-        prompt_enc = tokenizer(formatted, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+        full_text  = formatted + COMPLIANCE_TARGET
+        full_enc   = tokenizer(full_text, return_tensors="pt",
+                               add_special_tokens=False).input_ids.to(device)
+        prompt_enc = tokenizer(formatted, return_tensors="pt",
+                               add_special_tokens=False).input_ids.to(device)
         prompt_len = prompt_enc.shape[1]
-
         if full_enc.shape[1] <= prompt_len:
             return None
-
         labels = full_enc.clone()
         labels[0, :prompt_len] = -100
         attn = torch.ones_like(full_enc)
-
         model.zero_grad()
         outputs = model(input_ids=full_enc, attention_mask=attn, labels=labels)
         outputs.loss.backward()
-
         grad_parts = []
-        for param in target_params:
+        for _, param in target_params:
             if param.grad is not None:
                 grad_parts.append(param.grad.detach().float().cpu().flatten())
-
         model.zero_grad()
         torch.cuda.empty_cache()
-
         if not grad_parts:
             return None
-
         grad_vec = torch.cat(grad_parts).numpy()
         norm = np.linalg.norm(grad_vec)
         if norm < 1e-10:
             return None
         return grad_vec / norm
-
     except Exception as e:
         logger.warning(f"Gradient error: {e}")
         model.zero_grad()
@@ -251,10 +307,11 @@ def balanced_auc(scores, y):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model",      default=MODEL_NAME)
-    parser.add_argument("--output_dir", default="full_trait_output/baselines_all_attacks")
-    parser.add_argument("--device",     default="cuda")
-    parser.add_argument("--test",       action="store_true")
+    parser.add_argument("--model",          default=MODEL_NAME)
+    parser.add_argument("--output_dir",     default="full_trait_output/baselines_all_attacks")
+    parser.add_argument("--top_param_frac", type=float, default=TOP_PARAM_FRAC)
+    parser.add_argument("--device",         default="cuda")
+    parser.add_argument("--test",           action="store_true")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -271,19 +328,15 @@ def main():
     for param in model.parameters():
         param.requires_grad_(True)
 
-    target_params = get_target_params(model)
-    grad_dim = sum(p.numel() for p in target_params)
-    logger.info(f"  Gradient params: {len(target_params)} tensors, {grad_dim:,} dims")
-
     logger.info("Fetching jailbreak templates...")
     jailbreak_templates = fetch_jailbreaks()
 
-    # ── Build reference set from full HarmBench training split (seed 0) ────────
-    logger.info("\n=== Building reference set (full HarmBench training split, seed=0) ===")
+    # ── Build splits ──────────────────────────────────────────────────────────
     hb_cfg  = DATASETS["HarmBench"]
     hb_rows = load_jsonl(hb_cfg["responses"])
     hb_rows = [r for r in hb_rows if r.get("attack_type") == "human_jailbreak"]
-    hb_pm   = build_prompt_map_harmbench(hb_cfg["metadata"], hb_cfg["responses"], jailbreak_templates)
+    hb_pm   = build_prompt_map_harmbench(
+        hb_cfg["metadata"], hb_cfg["responses"], jailbreak_templates)
 
     train_beh, train_tpl, test_beh, test_tpl = get_pool_split(hb_rows, TRAIN_FRAC, seed=0)
     train_rows = [r for r in hb_rows
@@ -291,69 +344,93 @@ def main():
     test_rows  = [r for r in hb_rows
                   if r["behavior_id"] in test_beh  and r["jailbreak_idx"] in test_tpl]
 
-    jb_train     = [r for r in train_rows if r.get("jailbroken")]
-    benign_train = [r for r in train_rows if not r.get("jailbroken")]
-    logger.info(f"  Training split: {len(train_rows)} rows ({len(jb_train)} jb, {len(benign_train)} benign)")
+    # Split train 50/50 into calibration and reference
+    rng_split = random.Random(RANDOM_SEED)
+    train_shuffled = list(train_rows)
+    rng_split.shuffle(train_shuffled)
+    n_calib    = len(train_shuffled) // 2
+    calib_rows = train_shuffled[:n_calib]
+    ref_rows   = train_shuffled[n_calib:]
+
+    calib_jb   = [r for r in calib_rows if r.get("jailbroken")]
+    ref_jb     = [r for r in ref_rows   if r.get("jailbroken")]
+    ref_benign = [r for r in ref_rows   if not r.get("jailbroken")]
+
+    logger.info(f"\n=== Data splits ===")
+    logger.info(f"  Calibration: {len(calib_rows)} rows ({len(calib_jb)} jb) → param selection")
+    logger.info(f"  Reference:   {len(ref_rows)} rows ({len(ref_jb)} jb, {len(ref_benign)} benign)")
+    logger.info(f"  Test:        {len(test_rows)} rows")
 
     if args.test:
-        jb_train     = jb_train[:5]
-        benign_train = benign_train[:5]
+        calib_jb   = calib_jb[:5]
+        ref_jb     = ref_jb[:5]
+        ref_benign = ref_benign[:5]
+        test_rows  = test_rows[:10]
 
-    logger.info(f"  Computing {len(jb_train)} jailbreak reference gradients...")
-    jb_refs = []
-    for i, row in enumerate(jb_train):
+    # ── Step 1: Parameter selection ───────────────────────────────────────────
+    logger.info(f"\n=== Step 1: Safety-critical parameter selection ===")
+    candidate_params = get_candidate_params(model)
+    calib_prompts = [hb_pm[r["pair_id"]] for r in calib_jb if r["pair_id"] in hb_pm]
+    norm_accum = accumulate_gradient_norms(
+        model, tokenizer, calib_prompts, candidate_params, device)
+    target_params = select_safety_critical_params(
+        norm_accum, candidate_params, args.top_param_frac)
+
+    with open(output_dir / "gradsafe_selected_params.json", "w") as f:
+        json.dump({
+            "n_candidate":  len(candidate_params),
+            "n_selected":   len(target_params),
+            "top_frac":     args.top_param_frac,
+            "selected_names": [name for name, _ in target_params],
+        }, f, indent=2)
+
+    # ── Step 2: Reference gradients ───────────────────────────────────────────
+    logger.info(f"\n=== Step 2: Reference gradients ===")
+    jb_refs, benign_refs = [], []
+
+    for i, row in enumerate(ref_jb):
         if i % 50 == 0:
-            logger.info(f"    JB ref {i}/{len(jb_train)}")
-        prompt = hb_pm.get(row["pair_id"], "")
-        if not prompt:
-            continue
-        g = compute_gradient_vector(model, tokenizer, prompt, target_params, device)
+            logger.info(f"  JB ref {i}/{len(ref_jb)}")
+        g = compute_gradient_vector(model, tokenizer, hb_pm.get(row["pair_id"], ""),
+                                    target_params, device)
         if g is not None:
             jb_refs.append(g)
 
-    logger.info(f"  Computing {len(benign_train)} benign reference gradients...")
-    benign_refs = []
-    for i, row in enumerate(benign_train):
+    for i, row in enumerate(ref_benign):
         if i % 50 == 0:
-            logger.info(f"    Benign ref {i}/{len(benign_train)}")
-        prompt = hb_pm.get(row["pair_id"], "")
-        if not prompt:
-            continue
-        g = compute_gradient_vector(model, tokenizer, prompt, target_params, device)
+            logger.info(f"  Benign ref {i}/{len(ref_benign)}")
+        g = compute_gradient_vector(model, tokenizer, hb_pm.get(row["pair_id"], ""),
+                                    target_params, device)
         if g is not None:
             benign_refs.append(g)
 
     logger.info(f"  Got {len(jb_refs)} jb refs, {len(benign_refs)} benign refs")
     if not jb_refs or not benign_refs:
-        logger.error("No reference gradients computed — exiting")
+        logger.error("No reference gradients — exiting")
         return
 
-    # Save references for potential reuse
-    np.save(output_dir / "gradsafe_jb_refs.npy",     np.stack(jb_refs))
-    np.save(output_dir / "gradsafe_benign_refs.npy",  np.stack(benign_refs))
-    logger.info("  Reference gradients saved.")
+    np.save(output_dir / "gradsafe_jb_refs.npy",    np.stack(jb_refs))
+    np.save(output_dir / "gradsafe_benign_refs.npy", np.stack(benign_refs))
 
-    # ── Score all datasets ─────────────────────────────────────────────────────
-    results = {}
+    # ── Step 3: Score all datasets ─────────────────────────────────────────────
+    logger.info(f"\n=== Step 3: Scoring ===")
 
     def score_rows(name, rows, prompt_map, filter_type=None):
         if filter_type:
             rows = [r for r in rows if r.get("attack_type") == filter_type]
-        # For HarmBench use only held-out test split
         if name == "HarmBench":
-            rows = [r for r in rows if r["behavior_id"] in test_beh and r["jailbreak_idx"] in test_tpl]
+            rows = [r for r in rows
+                    if r["behavior_id"] in test_beh and r["jailbreak_idx"] in test_tpl]
         if args.test:
             rows = rows[:10]
-
         scores_list, y_list = [], []
         for i, row in enumerate(rows):
             if i % 50 == 0:
                 logger.info(f"  {name} {i}/{len(rows)}")
-            pid = row["pair_id"]
-            jb  = row.get("jailbroken")
+            jb = row.get("jailbroken")
             if jb is None:
                 continue
-            prompt = prompt_map.get(pid, "")
+            prompt = prompt_map.get(row["pair_id"], "")
             if not prompt:
                 continue
             grad = compute_gradient_vector(model, tokenizer, prompt, target_params, device)
@@ -361,49 +438,45 @@ def main():
                 continue
             scores_list.append(gradsafe_score(grad, jb_refs, benign_refs))
             y_list.append(1 if jb else 0)
-
-        y = np.array(y_list)
+        y   = np.array(y_list)
         auc = balanced_auc(scores_list, y)
         logger.info(f"  {name}: {len(y)} pairs, {y.sum():.0f} jb, AUC={auc:.4f}")
         return auc, len(y), int(y.sum())
 
+    results = {}
     for name, cfg in DATASETS.items():
         if not Path(cfg["responses"]).exists():
             logger.warning(f"Skipping {name} — not found")
             continue
-        logger.info(f"\n=== Scoring {name} ===")
+        logger.info(f"\n--- {name} ---")
         rows = load_jsonl(cfg["responses"])
-        if name == "HarmBench":
-            pm = hb_pm
-            filter_type = "human_jailbreak"
-        else:
-            pm = build_prompt_map_generic(rows, cfg["test_cases"])
-            filter_type = None
-
-        auc, n, n_jb = score_rows(name, rows, pm, filter_type)
+        pm   = hb_pm if name == "HarmBench" else build_prompt_map_generic(rows, cfg["test_cases"])
+        ft   = "human_jailbreak" if name == "HarmBench" else None
+        auc, n, n_jb = score_rows(name, rows, pm, ft)
         results[name] = {"n": n, "n_jb": n_jb, "auc": auc}
 
     # ── Summary ────────────────────────────────────────────────────────────────
     sep = "=" * 70
     print(f"\n{sep}")
-    print(f"  GRADSAFE — ALL ATTACK FAMILIES  (balanced AUC, best direction)")
-    print(f"  Reference: {len(jb_refs)} jb + {len(benign_refs)} benign (full HarmBench train split)")
+    print(f"  GRADSAFE (full) — ALL ATTACK FAMILIES")
+    print(f"  Calib: {len(calib_jb)} jb → top {args.top_param_frac:.0%} params")
+    print(f"  Refs:  {len(jb_refs)} jb + {len(benign_refs)} benign")
+    print(f"  Balanced AUC (50/50, best direction)")
     print(sep)
     print(f"  {'Family':12s}  {'N':>6}  {'JB%':>6}  {'AUC':>8}")
     print("  " + "─" * 38)
     for name, r in results.items():
-        jb_rate = r["n_jb"] / r["n"] if r["n"] > 0 else 0
-        print(f"  {name:12s}  {r['n']:>6}  {jb_rate:>6.1%}  {r['auc']:>8.4f}")
+        rate = r["n_jb"] / r["n"] if r["n"] > 0 else 0
+        print(f"  {name:12s}  {r['n']:>6}  {rate:>6.1%}  {r['auc']:>8.4f}")
     print(sep)
 
-    out_path = output_dir / "gradsafe_all_attacks.json"
-    with open(out_path, "w") as f:
-        json.dump({
-            "n_jb_refs": len(jb_refs),
-            "n_benign_refs": len(benign_refs),
-            "results": results,
-        }, f, indent=2)
-    logger.info(f"Saved to {out_path}")
+    with open(output_dir / "gradsafe_all_attacks.json", "w") as f:
+        json.dump({"n_calib_jb": len(calib_jb), "n_ref_jb": len(jb_refs),
+                   "n_ref_benign": len(benign_refs),
+                   "top_param_frac": args.top_param_frac,
+                   "n_params_selected": len(target_params),
+                   "results": results}, f, indent=2)
+    logger.info(f"Saved to {output_dir}/gradsafe_all_attacks.json")
 
 
 if __name__ == "__main__":
