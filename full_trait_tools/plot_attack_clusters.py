@@ -108,7 +108,8 @@ def main():
 
     ax = axes[0]
     ax.set_title("By Attack Family", fontsize=12)
-    for name in FAMILIES_ORDER := ["HarmBench", "GCG", "PAIR", "PAP", "GPTFuzz", "PEZ"]:
+    FAMILIES_ORDER = ["HarmBench", "GCG", "PAIR", "PAP", "GPTFuzz", "PEZ"]
+    for name in FAMILIES_ORDER:
         mask = families == name
         if not mask.any():
             continue
