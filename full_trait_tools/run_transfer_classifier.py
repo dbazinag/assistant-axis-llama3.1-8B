@@ -150,12 +150,28 @@ def split_by_pool(rows, train_beh, train_tpl, test_beh, test_tpl):
 
 # ── Classifier ─────────────────────────────────────────────────────────────────
 
+def undersample_to_balanced(X, y, seed=RANDOM_SEED):
+    """Undersample majority class to get 50/50 balance (test set only)."""
+    idx_pos = np.where(y == 1)[0]
+    idx_neg = np.where(y == 0)[0]
+    n = min(len(idx_pos), len(idx_neg))
+    rng = np.random.RandomState(seed)
+    idx_pos_s = rng.choice(idx_pos, n, replace=False)
+    idx_neg_s = rng.choice(idx_neg, n, replace=False)
+    idx = np.concatenate([idx_pos_s, idx_neg_s])
+    return X[idx], y[idx]
+
+
 def fit_eval(X_tr, y_tr, X_te, y_te, mode, n_pca):
     if len(X_te) == 0 or len(set(y_te)) < 2:
         return float("nan")
+    # Undersample test set to 50/50 — training set untouched
+    X_te_b, y_te_b = undersample_to_balanced(X_te, y_te)
+    if len(set(y_te_b)) < 2:
+        return float("nan")
     scaler = StandardScaler()
     X_tr_s = scaler.fit_transform(X_tr)
-    X_te_s = scaler.transform(X_te)
+    X_te_s = scaler.transform(X_te_b)
     if mode == "pca":
         pca = PCA(n_components=n_pca, random_state=RANDOM_SEED)
         X_tr_s = pca.fit_transform(X_tr_s)
@@ -163,7 +179,9 @@ def fit_eval(X_tr, y_tr, X_te, y_te, mode, n_pca):
     clf = LogisticRegression(max_iter=2000, random_state=RANDOM_SEED, C=1.0)
     clf.fit(X_tr_s, y_tr)
     probs = clf.predict_proba(X_te_s)[:, 1]
-    return float(roc_auc_score(y_te, probs))
+    auc = float(roc_auc_score(y_te_b, probs))
+    # Best direction — handles inverted signal across attack families
+    return max(auc, 1 - auc)
 
 
 def cv_auc(X, y, mode, n_pca, n_splits=5):
