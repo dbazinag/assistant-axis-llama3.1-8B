@@ -41,13 +41,20 @@ TRAIN_FRAC  = 0.7
 N_SEEDS     = 50
 RANDOM_SEED = 42
 
-HIDDEN_DIMS  = [256, 128, 64]
-DROPOUT      = 0.3
-LR           = 1e-3
-WEIGHT_DECAY = 1e-4
-MAX_EPOCHS   = 200
-PATIENCE     = 20
-BATCH_SIZE   = 64
+HIDDEN_DIMS_RAW    = [256, 128, 64]   # raw/pca: large input needs capacity
+HIDDEN_DIMS_TRAITS = [64, 32]          # all_traits/top_traits: simpler generalizes better
+DROPOUT_RAW        = 0.3
+DROPOUT_TRAITS     = 0.5
+WEIGHT_DECAY_RAW   = 1e-4
+WEIGHT_DECAY_TRAITS = 1e-2
+MAX_EPOCHS         = 200
+PATIENCE           = 20
+BATCH_SIZE         = 64
+
+def get_mode_config(mode):
+    if mode in ("raw", "pca"):
+        return HIDDEN_DIMS_RAW, DROPOUT_RAW, WEIGHT_DECAY_RAW
+    return HIDDEN_DIMS_TRAITS, DROPOUT_TRAITS, WEIGHT_DECAY_TRAITS
 
 
 # ── MLP ────────────────────────────────────────────────────────────────────────
@@ -67,12 +74,12 @@ class MLP(nn.Module):
         return self.net(x).squeeze(1)
 
 
-def train_mlp(X_tr, y_tr, X_val, y_val, input_dim, seed, device="cpu"):
+def train_mlp(X_tr, y_tr, X_val, y_val, input_dim, seed, hidden_dims, dropout, weight_decay, device="cpu"):
     torch.manual_seed(seed)
-    model = MLP(input_dim, HIDDEN_DIMS, DROPOUT).to(device)
+    model = MLP(input_dim, hidden_dims, dropout).to(device)
     pos_weight = torch.tensor([(y_tr == 0).sum() / max((y_tr == 1).sum(), 1)],
                                dtype=torch.float32).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=weight_decay)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, MAX_EPOCHS)
 
@@ -366,7 +373,9 @@ def main():
                 X_val_s = pca_obj.transform(X_val_s)
                 X_te_s  = pca_obj.transform(X_te_s)
 
-            mlp = train_mlp(X_tr_s, y_tr, X_val_s, y_val, X_tr_s.shape[1], seed, device)
+            hidden_dims, dropout, weight_decay = get_mode_config(mode)
+            mlp = train_mlp(X_tr_s, y_tr, X_val_s, y_val, X_tr_s.shape[1], seed,
+                            hidden_dims, dropout, weight_decay, device)
             results[mode]["human_test"].append(eval_mlp(mlp, X_te_s, y_te, device))
 
             for name, (X_raw, X_traits, X_top, y_t) in transfer_traits.items():
@@ -382,7 +391,9 @@ def main():
     # ── Summary ───────────────────────────────────────────────────────────────
     sep = "=" * 110
     print(f"\n\n{sep}")
-    print(f"  MLP TRANSFER SUMMARY  |  Layer {args.layer}  |  {args.n_seeds} seeds  |  {HIDDEN_DIMS} hidden dims")
+    print(f"  MLP TRANSFER SUMMARY  |  Layer {args.layer}  |  {args.n_seeds} seeds")
+    print(f"  raw/pca: {HIDDEN_DIMS_RAW} dropout={DROPOUT_RAW} wd={WEIGHT_DECAY_RAW}")
+    print(f"  traits:  {HIDDEN_DIMS_TRAITS} dropout={DROPOUT_TRAITS} wd={WEIGHT_DECAY_TRAITS}")
     print(sep)
 
     families = list(transfer_matrices.keys())
