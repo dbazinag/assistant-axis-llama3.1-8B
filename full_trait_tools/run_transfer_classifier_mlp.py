@@ -145,8 +145,10 @@ def load_jsonl(path):
 
 
 def load_activations(path):
-    print(f"  Loading {path}...")
-    return torch.load(path, map_location="cpu", weights_only=False)
+    print(f"  Loading {path}...", flush=True)
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    print(f"  Done loading {Path(path).name}", flush=True)
+    return data
 
 
 def load_trait_matrix(vectors_dir, layer):
@@ -251,10 +253,15 @@ def main():
     device = args.device
 
     # ── Load all datasets ──────────────────────────────────────────────────────
-    print("\n=== Loading data ===")
+    print("\n=== Loading data ===", flush=True)
+    print("Loading human responses...", flush=True)
     human_rows_all = load_jsonl(args.human_classified_path)
     human_rows = [r for r in human_rows_all if r.get("attack_type") == "human_jailbreak"]
+    print(f"  Human responses: {len(human_rows)} rows", flush=True)
+
+    print("Loading human activations...", flush=True)
     human_acts = load_activations(args.human_activations_path)
+    print(f"  Human activations loaded: {len(human_acts)} pairs", flush=True)
 
     transfer_datasets = {}
     for name, cp, ap in [
@@ -265,12 +272,16 @@ def main():
         ("PEZ",      args.pez_classified_path,     args.pez_activations_path),
     ]:
         if Path(cp).exists() and Path(ap).exists():
+            print(f"Loading {name} responses...", flush=True)
             rows = load_jsonl(cp)
+            print(f"Loading {name} activations...", flush=True)
             acts = load_activations(ap)
             transfer_datasets[name] = (rows, acts)
-            print(f"  {name}: {len(rows)} rows")
+            print(f"  {name}: {len(rows)} rows loaded", flush=True)
+        else:
+            print(f"  Skipping {name} — files not found", flush=True)
 
-    print("Trait vectors...")
+    print("Loading trait vectors...", flush=True)
     trait_matrix, trait_names = load_trait_matrix(args.trait_vectors_dir, args.layer)
     w_vec = load_hyperplane(args.hyperplane_path)
     cos_w = np.abs(trait_matrix @ w_vec)
