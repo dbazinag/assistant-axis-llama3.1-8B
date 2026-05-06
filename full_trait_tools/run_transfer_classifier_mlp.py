@@ -152,6 +152,18 @@ def load_activations(path):
 
 
 def load_trait_matrix(vectors_dir, layer):
+    # Check for cached numpy version first (much faster)
+    cache_mat  = Path(f"full_trait_output/trait_matrix_layer{layer}.npy")
+    cache_names = Path(f"full_trait_output/trait_names_layer{layer}.json")
+    if cache_mat.exists() and cache_names.exists():
+        print(f"  Loading cached trait matrix from {cache_mat}...", flush=True)
+        matrix = np.load(str(cache_mat))
+        names  = json.load(open(cache_names))
+        print(f"  Loaded {len(names)} traits from cache", flush=True)
+        return matrix, names
+
+    # Fall back to loading individual .pt files
+    print(f"  Loading {len(list(Path(vectors_dir).glob('*.pt')))} trait .pt files...", flush=True)
     vecs, names = [], []
     for pt_file in sorted(Path(vectors_dir).glob("*.pt")):
         try:
