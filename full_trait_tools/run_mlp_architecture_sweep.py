@@ -5,19 +5,15 @@ run_mlp_architecture_sweep.py
 Sweeps MLP architectures from very simple (high bias) to very complex
 (high variance) to find the bias-variance sweet spot for jailbreak transfer.
 
-Tests 10 architectures × 10 seeds × 4 modes × all attack families.
+Tests 20 architectures × 10 seeds × 4 modes × all attack families.
 
 Architectures ordered simple → complex:
-  1.  [32]
-  2.  [64]
-  3.  [128]
-  4.  [64, 32]
-  5.  [128, 64]
-  6.  [256, 128]
-  7.  [256, 128, 64]        ← current baseline
-  8.  [512, 256, 128]
-  9.  [512, 256, 128, 64]
-  10. [1024, 512, 256, 128]
+  Very simple:  [8], [16], [32], [64], [128]
+  Shallow 2L:   [32,16], [64,32], [128,64], [256,128]
+  Medium 3L:    [64,32,16], [128,64,32], [256,128,64]*, [512,256,128]
+  Deep 4L:      [128,64,32,16], [256,128,64,32], [512,256,128,64], [1024,512,256,128]
+  Very deep 5L: [256,128,64,32,16], [512,256,128,64,32], [1024,512,256,128,64]
+  * current baseline
 
 Usage:
   uv run python full_trait_tools/run_mlp_architecture_sweep.py
@@ -50,16 +46,31 @@ PATIENCE     = 20
 BATCH_SIZE   = 64
 
 ARCHITECTURES = [
+    # Very simple — high bias
+    [8],
+    [16],
     [32],
     [64],
     [128],
+    # Shallow 2-layer
+    [32, 16],
     [64, 32],
     [128, 64],
     [256, 128],
-    [256, 128, 64],
+    # Medium 3-layer
+    [64, 32, 16],
+    [128, 64, 32],
+    [256, 128, 64],        # current baseline
     [512, 256, 128],
+    # Deep 4-layer
+    [128, 64, 32, 16],
+    [256, 128, 64, 32],
     [512, 256, 128, 64],
     [1024, 512, 256, 128],
+    # Very deep 5-layer — high variance
+    [256, 128, 64, 32, 16],
+    [512, 256, 128, 64, 32],
+    [1024, 512, 256, 128, 64],
 ]
 
 
