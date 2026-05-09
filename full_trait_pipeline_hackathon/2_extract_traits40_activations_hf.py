@@ -271,12 +271,6 @@ def extract_positions_for_batch(
         add_special_tokens=False,
     )
 
-    # Keep unpadded token ids for robust answer-span fallback.
-    unpadded_input_ids = []
-    for i in range(encoded["input_ids"].shape[0]):
-        valid = encoded["attention_mask"][i].bool()
-        unpadded_input_ids.append(encoded["input_ids"][i][valid].detach().cpu().tolist())
-
     device = get_model_device(model)
     encoded = {k: v.to(device) for k, v in encoded.items()}
 
@@ -293,16 +287,19 @@ def extract_positions_for_batch(
     for layer_idx in layers:
         if layer_idx < 0:
             raise ValueError(f"Layer index must be non-negative, got {layer_idx}")
+
         hs_idx = layer_idx + 1
+
         if hs_idx >= len(hidden_states):
             raise ValueError(
                 f"Layer index {layer_idx} out of range. "
                 f"Model returned {len(hidden_states) - 1} hidden layers."
             )
+
         selected_hidden_states.append(hidden_states[hs_idx])
 
     batch_outputs: Dict[str, List[Optional[torch.Tensor]]] = {
-        name: [] for name in POSITION_NAMES
+        "pre_generation_last_token": []
     }
 
     for batch_idx, row in enumerate(batch_rows):
@@ -311,92 +308,27 @@ def extract_positions_for_batch(
         offset = get_valid_offset(tokenizer, attn_row)
 
         meta = row["chat_template_metadata"]
-
-        user_last_idx = int(meta["user_last_token_index"])
         pregen_last_idx = int(meta["full_prompt_last_token_index"])
-        assistant_header_indices = list(meta["assistant_header_token_indices"])
-        user_indices = list(meta["user_content_token_indices"])
-        answer_indices = get_answer_span_from_row(
-            tokenizer,
-            row,
-            full_token_ids=unpadded_input_ids[batch_idx],
+
+        shifted_idx = pregen_last_idx + offset
+
+        if shifted_idx < offset or shifted_idx >= offset + valid_len:
+            batch_outputs["pre_generation_last_token"].append(None)
+            continue
+
+        if shifted_idx >= encoded["input_ids"].shape[1]:
+            batch_outputs["pre_generation_last_token"].append(None)
+            continue
+
+        stacked = torch.stack(
+            [
+                hs[batch_idx, shifted_idx, :].detach().cpu()
+                for hs in selected_hidden_states
+            ],
+            dim=0,
         )
 
-        def shift_and_validate(indices: Optional[List[int]]) -> Optional[List[int]]:
-            if indices is None or len(indices) == 0:
-                return None
-
-            shifted = [int(idx) + offset for idx in indices]
-
-            for idx in shifted:
-                if idx < offset or idx >= offset + valid_len:
-                    return None
-                if idx >= encoded["input_ids"].shape[1]:
-                    return None
-
-            return shifted
-
-        user_last_shifted = shift_and_validate([user_last_idx])
-        pregen_last_shifted = shift_and_validate([pregen_last_idx])
-        assistant_header_shifted = shift_and_validate(assistant_header_indices)
-        user_shifted = shift_and_validate(user_indices)
-        answer_shifted = shift_and_validate(answer_indices)
-
-        if user_last_shifted is None:
-            batch_outputs["user_last_token"].append(None)
-        else:
-            idx = user_last_shifted[0]
-            stacked = torch.stack(
-                [hs[batch_idx, idx, :].detach().cpu() for hs in selected_hidden_states],
-                dim=0,
-            )
-            batch_outputs["user_last_token"].append(stacked)
-
-        if pregen_last_shifted is None:
-            batch_outputs["pre_generation_last_token"].append(None)
-        else:
-            idx = pregen_last_shifted[0]
-            stacked = torch.stack(
-                [hs[batch_idx, idx, :].detach().cpu() for hs in selected_hidden_states],
-                dim=0,
-            )
-            batch_outputs["pre_generation_last_token"].append(stacked)
-
-        if assistant_header_shifted is None:
-            batch_outputs["assistant_header_mean"].append(None)
-            batch_outputs["assistant_header_span"].append(None)
-        else:
-            span = assistant_header_shifted
-            mean_stacked = torch.stack(
-                [hs[batch_idx, span, :].mean(dim=0).detach().cpu() for hs in selected_hidden_states],
-                dim=0,
-            )
-            span_stacked = torch.stack(
-                [hs[batch_idx, span, :].detach().cpu() for hs in selected_hidden_states],
-                dim=0,
-            )
-            batch_outputs["assistant_header_mean"].append(mean_stacked)
-            batch_outputs["assistant_header_span"].append(span_stacked)
-
-        if answer_shifted is None:
-            batch_outputs["answer_mean"].append(None)
-        else:
-            span = answer_shifted
-            mean_stacked = torch.stack(
-                [hs[batch_idx, span, :].mean(dim=0).detach().cpu() for hs in selected_hidden_states],
-                dim=0,
-            )
-            batch_outputs["answer_mean"].append(mean_stacked)
-
-        if user_shifted is None:
-            batch_outputs["user_mean"].append(None)
-        else:
-            span = user_shifted
-            mean_stacked = torch.stack(
-                [hs[batch_idx, span, :].mean(dim=0).detach().cpu() for hs in selected_hidden_states],
-                dim=0,
-            )
-            batch_outputs["user_mean"].append(mean_stacked)
+        batch_outputs["pre_generation_last_token"].append(stacked)
 
     del outputs
     del hidden_states
