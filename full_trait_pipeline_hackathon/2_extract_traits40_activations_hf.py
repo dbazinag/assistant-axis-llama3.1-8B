@@ -31,12 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 POSITION_NAMES = [
-    "user_last_token",
     "pre_generation_last_token",
-    "assistant_header_mean",
-    "assistant_header_span",
-    "answer_mean",
-    "user_mean",
 ]
 
 
