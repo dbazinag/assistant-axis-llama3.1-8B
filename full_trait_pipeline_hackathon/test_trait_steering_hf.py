@@ -100,13 +100,16 @@ def load_trait_vector(path: Path) -> torch.Tensor:
 
 
 def get_layers(model):
-    # Gemma4 text model usually lands under language_model.model.layers.
     candidates = [
         "language_model.model.layers",
         "language_model.layers",
         "model.layers",
-        "model.decoder.layers",
+        "model.model.layers",
+        "model.language_model.layers",
+        "model.language_model.model.layers",
+        "text_model.layers",
         "transformer.h",
+        "model.decoder.layers",
     ]
 
     for attr in candidates:
@@ -120,19 +123,29 @@ def get_layers(model):
         if ok:
             return obj
 
+    # Generic fallback: find the first ModuleList with length matching text_config.num_hidden_layers.
+    target_n = None
+    cfg = getattr(model, "config", None)
+
+    if cfg is not None:
+        text_config = getattr(cfg, "text_config", None)
+        if text_config is not None:
+            target_n = getattr(text_config, "num_hidden_layers", None)
+
+        if target_n is None:
+            target_n = getattr(cfg, "num_hidden_layers", None)
+
+    if target_n is not None:
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.ModuleList) and len(module) == int(target_n):
+                print(f"Found layer ModuleList via fallback: {name}", flush=True)
+                return module
+
+    print("Could not locate layers. Top-level modules:", flush=True)
+    for name, module in model.named_children():
+        print(f"  {name}: {type(module)}", flush=True)
+
     raise RuntimeError("Cannot locate transformer layers in model.")
-
-
-def format_chat(tokenizer, prompt: str):
-    messages = [{"role": "user", "content": prompt}]
-    enc = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_tensors="pt",
-        return_dict=True,
-    )
-    return enc
 
 
 def move_batch_to_device(batch: dict, device):
