@@ -5,20 +5,18 @@
 import argparse
 import json
 import logging
-import os
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import jsonlines
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# chunked_sdpa shim — copy from /scratch/mechhack/starter_code/chunked_sdpa.py
 sys.path.insert(0, str(Path(__file__).parent))
 from chunked_sdpa import chunked_sdpa_scope
 
@@ -68,6 +66,38 @@ def traceback_string() -> str:
     return traceback.format_exc()
 
 
+def normalize_token_ids(x) -> List[int]:
+    """
+    Robustly convert tokenizer output into a flat list of token ids.
+    Some HF/tokenizer versions return a list, tensor, BatchEncoding, or dict.
+    """
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().tolist()
+
+    if isinstance(x, dict):
+        if "input_ids" not in x:
+            raise ValueError(f"Tokenizer output dict missing input_ids. Keys: {list(x.keys())}")
+        x = x["input_ids"]
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().tolist()
+
+    if hasattr(x, "data") and isinstance(getattr(x, "data"), dict):
+        data = x.data
+        if "input_ids" in data:
+            x = data["input_ids"]
+
+    if isinstance(x, list) and len(x) == 1 and isinstance(x[0], list):
+        x = x[0]
+
+    if not isinstance(x, list):
+        raise ValueError(f"Could not normalize tokenizer output of type {type(x)}")
+
+    if x and isinstance(x[0], list):
+        x = x[0]
+
+    return [int(t) for t in x]
+
+
 def load_trait(trait_file: Path) -> Dict[str, Any]:
     with open(trait_file, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -84,8 +114,10 @@ def load_trait(trait_file: Path) -> Dict[str, Any]:
 
 
 def build_messages(system_prompt: str, question: str) -> List[Dict[str, str]]:
-    return [{"role": "system", "content": system_prompt},
-            {"role": "user", "content": question}]
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
 
 
 def apply_chat_template_string(tokenizer, messages):
@@ -94,9 +126,7 @@ def apply_chat_template_string(tokenizer, messages):
 
 def apply_chat_template_tokens(tokenizer, messages):
     ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-    if isinstance(ids, torch.Tensor):
-        ids = ids.tolist()
-    return ids
+    return normalize_token_ids(ids)
 
 
 def find_subsequence(seq, sub):
@@ -110,27 +140,51 @@ def find_subsequence(seq, sub):
 
 
 def build_span_metadata(tokenizer, full_ids, system_prompt, question):
+    full_ids = normalize_token_ids(full_ids)
+
     if len(full_ids) == 0:
         raise ValueError("Prompt token ids are empty")
-    no_gen = tokenizer.apply_chat_template(
+
+    no_gen_raw = tokenizer.apply_chat_template(
         [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}],
-        tokenize=True, add_generation_prompt=False,
+        tokenize=True,
+        add_generation_prompt=False,
     )
-    if isinstance(no_gen, torch.Tensor):
-        no_gen = no_gen.tolist()
-    if len(no_gen) >= len(full_ids):
-        raise ValueError(f"add_generation_prompt didn't append: {len(no_gen)} vs {len(full_ids)}")
-    ah_start = len(no_gen)
-    ah_end = len(full_ids) - 1
-    ah_idxs = list(range(ah_start, ah_end + 1))
+    no_gen = normalize_token_ids(no_gen_raw)
+
+    # Some tokenizers append assistant-header tokens with add_generation_prompt=True.
+    # Some Gemma chat templates do not. Do not crash in that case.
+    if len(no_gen) < len(full_ids):
+        ah_start = len(no_gen)
+        ah_end = len(full_ids) - 1
+        ah_idxs = list(range(ah_start, ah_end + 1))
+    else:
+        ah_start = len(full_ids) - 1
+        ah_end = len(full_ids) - 1
+        ah_idxs = [ah_start]
+
     q_ids = tokenizer.encode(question, add_special_tokens=False)
+    q_ids = normalize_token_ids(q_ids)
+
     if not q_ids:
         raise ValueError("Question encoded to zero tokens")
+
     uc_start = find_subsequence(full_ids, q_ids)
+
+    if uc_start == -1:
+        # Fallback for chat templates that alter spacing around user content.
+        q_ids_alt = tokenizer.encode(" " + question, add_special_tokens=False)
+        q_ids_alt = normalize_token_ids(q_ids_alt)
+        uc_start = find_subsequence(full_ids, q_ids_alt)
+        if uc_start != -1:
+            q_ids = q_ids_alt
+
     if uc_start == -1:
         raise ValueError("Could not locate user-content tokens")
+
     uc_end = uc_start + len(q_ids) - 1
     uc_idxs = list(range(uc_start, uc_end + 1))
+
     return ah_idxs, ah_start, ah_end, uc_idxs, uc_start, uc_end, uc_end
 
 
@@ -142,23 +196,32 @@ def build_prompt_records_for_trait(tokenizer, trait_name, trait_file, trait_data
                 msgs = build_messages(sp, q)
                 full_ids = apply_chat_template_tokens(tokenizer, msgs)
                 ah_idxs, ah_s, ah_e, uc_idxs, uc_s, uc_e, ult = build_span_metadata(
-                    tokenizer, full_ids, sp, q)
-                records.append(PromptRecord(
-                    trait=trait_name, trait_file=str(trait_file),
-                    polarity=polarity, prompt_index=pi, question_index=qi,
-                    label=f"{polarity}_p{pi}_q{qi}",
-                    system_prompt=sp, instruction_text=sp, question=q, messages=msgs,
-                    prompt_token_count=len(full_ids),
-                    full_prompt_last_token_index=len(full_ids) - 1,
-                    assistant_header_token_indices=ah_idxs,
-                    assistant_header_token_start=ah_s,
-                    assistant_header_token_end=ah_e,
-                    user_content_token_indices=uc_idxs,
-                    user_content_token_start=uc_s,
-                    user_content_token_end=uc_e,
-                    user_last_token_index=ult,
-                    full_prompt_token_ids=full_ids,
-                ))
+                    tokenizer, full_ids, sp, q
+                )
+                records.append(
+                    PromptRecord(
+                        trait=trait_name,
+                        trait_file=str(trait_file),
+                        polarity=polarity,
+                        prompt_index=pi,
+                        question_index=qi,
+                        label=f"{polarity}_p{pi}_q{qi}",
+                        system_prompt=sp,
+                        instruction_text=sp,
+                        question=q,
+                        messages=msgs,
+                        prompt_token_count=len(full_ids),
+                        full_prompt_last_token_index=len(full_ids) - 1,
+                        assistant_header_token_indices=ah_idxs,
+                        assistant_header_token_start=ah_s,
+                        assistant_header_token_end=ah_e,
+                        user_content_token_indices=uc_idxs,
+                        user_content_token_start=uc_s,
+                        user_content_token_end=uc_e,
+                        user_last_token_index=ult,
+                        full_prompt_token_ids=full_ids,
+                    )
+                )
     return records
 
 
@@ -169,12 +232,18 @@ def record_to_output_row(record, response, model_name, gen_params):
         {"role": "assistant", "content": response},
     ]
     return {
-        "trait": record.trait, "trait_file": record.trait_file,
-        "polarity": record.polarity, "prompt_index": record.prompt_index,
-        "question_index": record.question_index, "label": record.label,
-        "system_prompt": record.system_prompt, "instruction_text": record.instruction_text,
-        "question": record.question, "conversation": conversation,
-        "assistant_response": response, "model": model_name,
+        "trait": record.trait,
+        "trait_file": record.trait_file,
+        "polarity": record.polarity,
+        "prompt_index": record.prompt_index,
+        "question_index": record.question_index,
+        "label": record.label,
+        "system_prompt": record.system_prompt,
+        "instruction_text": record.instruction_text,
+        "question": record.question,
+        "conversation": conversation,
+        "assistant_response": response,
+        "model": model_name,
         "generation_params": gen_params,
         "chat_template_metadata": {
             "prompt_token_count": record.prompt_token_count,
@@ -207,26 +276,36 @@ def write_error_log(path, trait, err, tb=None):
 
 def verify_trait_output_file(output_file, trait_data):
     rows = list(jsonlines.open(output_file, "r"))
+
     if len(rows) != 400:
         return False, f"Expected 400 rows, found {len(rows)}"
+
     seen = set()
     for row in rows:
         key = (row["polarity"], row["prompt_index"], row["question_index"])
+
         if key in seen:
             return False, f"Duplicate key: {key}"
         seen.add(key)
+
         if row["question"] != trait_data["questions"][row["question_index"]]:
             return False, f"Question mismatch at qidx={row['question_index']}"
-        expected_sp = (trait_data["instruction"][row["prompt_index"]]["pos"]
-                       if row["polarity"] == "positive"
-                       else trait_data["instruction"][row["prompt_index"]]["neg"])
+
+        expected_sp = (
+            trait_data["instruction"][row["prompt_index"]]["pos"]
+            if row["polarity"] == "positive"
+            else trait_data["instruction"][row["prompt_index"]]["neg"]
+        )
+
         if row["system_prompt"] != expected_sp:
             return False, f"System prompt mismatch at {row['polarity']} pidx={row['prompt_index']}"
+
     for pi in range(5):
         for pol in ("positive", "negative"):
             for qi in range(40):
                 if (pol, pi, qi) not in seen:
                     return False, f"Missing key: {(pol, pi, qi)}"
+
     return True, "ok"
 
 
@@ -245,9 +324,11 @@ class TraitResponseGenerator:
     def load(self):
         logger.info(f"Loading tokenizer from {self.model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"  # required for batched generation
+
+        self.tokenizer.padding_side = "left"
 
         logger.info(f"Loading model from {self.model_name} (this takes ~1 min)")
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -257,13 +338,14 @@ class TraitResponseGenerator:
             device_map="cuda:0",
             trust_remote_code=True,
         )
+
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad_(False)
 
-        # chunked_sdpa needed for Gemma 4-31B's head_dim=512
         self._sdpa_cm = chunked_sdpa_scope()
         self._sdpa_cm.__enter__()
+
         logger.info("Model loaded.")
 
     def unload(self):
@@ -273,10 +355,16 @@ class TraitResponseGenerator:
 
     def _generate_batch(self, prompt_texts: List[str]) -> List[str]:
         inputs = self.tokenizer(
-            prompt_texts, return_tensors="pt", padding=True, truncation=True,
-            max_length=self.max_model_len, add_special_tokens=False,
+            prompt_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_model_len,
+            add_special_tokens=False,
         ).to("cuda:0")
+
         seq_in = inputs.input_ids.shape[1]
+
         with torch.no_grad():
             gen = self.model.generate(
                 **inputs,
@@ -287,52 +375,75 @@ class TraitResponseGenerator:
                 pad_token_id=self.tokenizer.eos_token_id,
                 use_cache=True,
             )
+
         completions = []
         for i in range(gen.shape[0]):
             out_ids = gen[i, seq_in:]
             completions.append(self.tokenizer.decode(out_ids, skip_special_tokens=True))
+
         del gen, inputs
         torch.cuda.empty_cache()
+
         return completions
 
     def generate_trait_rows(self, trait_name, trait_file, trait_data):
         if self.tokenizer is None or self.model is None:
             raise RuntimeError("Generator not loaded")
+
         records = build_prompt_records_for_trait(self.tokenizer, trait_name, trait_file, trait_data)
         prompt_texts = [apply_chat_template_string(self.tokenizer, r.messages) for r in records]
 
         all_responses: List[str] = []
-        for i in tqdm(range(0, len(prompt_texts), self.batch_size),
-                     desc=f"  {trait_name}", leave=False):
+
+        for i in tqdm(
+            range(0, len(prompt_texts), self.batch_size),
+            desc=f"  {trait_name}",
+            leave=False,
+        ):
             batch = prompt_texts[i:i + self.batch_size]
             all_responses.extend(self._generate_batch(batch))
 
-        gen_params = {"temperature": self.temperature, "top_p": self.top_p,
-                      "max_tokens": self.max_tokens, "n": 1}
-        return [record_to_output_row(r, resp, self.model_name, gen_params)
-                for r, resp in zip(records, all_responses)]
+        gen_params = {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": self.max_tokens,
+            "n": 1,
+        }
+
+        return [
+            record_to_output_row(r, resp, self.model_name, gen_params)
+            for r, resp in zip(records, all_responses)
+        ]
 
 
 def discover_trait_names(traits_dir, responses_dir, selected):
     names = []
+
     for f in sorted(traits_dir.glob("*.json")):
         n = f.stem
+
         if selected and n not in selected:
             continue
+
         if (responses_dir / f"{n}.jsonl").exists():
             logger.info(f"Skipping '{n}' (already exists)")
             continue
+
         names.append(n)
+
     return names
 
 
 def build_run_manifest(args, trait_names):
     return {
-        "created_at_utc": utc_now_iso(), "model": args.model,
+        "created_at_utc": utc_now_iso(),
+        "model": args.model,
         "traits_dir": str(Path(args.traits_dir).resolve()),
         "output_root": str(Path(args.output_root).resolve()),
-        "max_model_len": args.max_model_len, "temperature": args.temperature,
-        "top_p": args.top_p, "max_tokens": args.max_tokens,
+        "max_model_len": args.max_model_len,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "max_tokens": args.max_tokens,
         "batch_size": args.batch_size,
         "questions_source": "per-trait JSON files only",
         "expected_questions_per_trait": 40,
@@ -347,6 +458,7 @@ def build_run_manifest(args, trait_names):
 
 def parse_args():
     p = argparse.ArgumentParser()
+
     p.add_argument("--model", type=str, required=True)
     p.add_argument("--traits_dir", type=str, default="data/traits/instructions")
     p.add_argument("--output_root", type=str, default="full_trait_output/traits40_generation")
@@ -356,12 +468,15 @@ def parse_args():
     p.add_argument("--max_tokens", type=int, default=512)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--traits", nargs="+", help="Specific traits to process")
+
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
     out = Path(args.output_root)
+
     (out / "responses").mkdir(parents=True, exist_ok=True)
     (out / "verification").mkdir(parents=True, exist_ok=True)
     (out / "manifests").mkdir(parents=True, exist_ok=True)
@@ -373,6 +488,7 @@ def main():
     traits_dir = Path(args.traits_dir)
 
     trait_names = discover_trait_names(traits_dir, responses_dir, args.traits)
+
     if not trait_names:
         logger.info("No traits to process")
         return 0
@@ -380,10 +496,14 @@ def main():
     write_json(out / "manifests" / "run_config.json", build_run_manifest(args, trait_names))
 
     gen = TraitResponseGenerator(
-        model_name=args.model, max_model_len=args.max_model_len,
-        temperature=args.temperature, top_p=args.top_p,
-        max_tokens=args.max_tokens, batch_size=args.batch_size,
+        model_name=args.model,
+        max_model_len=args.max_model_len,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        batch_size=args.batch_size,
     )
+
     gen.load()
 
     try:
@@ -391,25 +511,40 @@ def main():
             output_file = responses_dir / f"{tn}.jsonl"
             verification_file = verification_dir / f"{tn}.json"
             trait_file = traits_dir / f"{tn}.json"
+
             try:
                 td = load_trait(trait_file)
                 rows = gen.generate_trait_rows(tn, trait_file, td)
+
                 output_file.parent.mkdir(parents=True, exist_ok=True)
+
                 with jsonlines.open(output_file, "w") as w:
                     w.write_all(rows)
+
                 ok, msg = verify_trait_output_file(output_file, td)
-                write_json(verification_file, {
-                    "trait": tn, "verified_at": utc_now_iso(),
-                    "ok": ok, "message": msg,
-                    "row_count": len(rows), "expected_row_count": 400,
-                })
+
+                write_json(
+                    verification_file,
+                    {
+                        "trait": tn,
+                        "verified_at": utc_now_iso(),
+                        "ok": ok,
+                        "message": msg,
+                        "row_count": len(rows),
+                        "expected_row_count": 400,
+                    },
+                )
+
                 if not ok:
                     raise RuntimeError(f"Verification failed for {tn}: {msg}")
+
                 logger.info(f"Saved+verified {len(rows)} for '{tn}'")
+
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
                 write_error_log(error_log, tn, err, traceback_string())
                 logger.error(f"Failed '{tn}': {err}")
+
     finally:
         gen.unload()
 
