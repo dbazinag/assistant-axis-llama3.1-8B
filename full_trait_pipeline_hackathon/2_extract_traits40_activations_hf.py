@@ -147,16 +147,26 @@ class HFProbingModel:
             self._sdpa_cm = None
 
     def get_layers(self):
-        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            return self.model.model.layers
-        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
-            return self.model.transformer.h
+    n_layers = getattr(self.model.config, "num_hidden_layers", None)
+    if n_layers is not None:
+        return list(range(int(n_layers)))
 
-        n_layers = getattr(self.model.config, "num_hidden_layers", None)
-        if n_layers is None:
-            raise ValueError("Could not infer number of hidden layers")
-        return list(range(n_layers))
+    text_config = getattr(self.model.config, "text_config", None)
+    if text_config is not None:
+        n_layers = getattr(text_config, "num_hidden_layers", None)
+        if n_layers is not None:
+            return list(range(int(n_layers)))
 
+    if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+        return self.model.model.layers
+
+    if hasattr(self.model, "language_model") and hasattr(self.model.language_model, "layers"):
+        return self.model.language_model.layers
+
+    if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
+        return self.model.transformer.h
+
+    raise ValueError("Could not infer number of hidden layers")
 
 def load_responses(responses_file: Path) -> List[dict]:
     rows = []
