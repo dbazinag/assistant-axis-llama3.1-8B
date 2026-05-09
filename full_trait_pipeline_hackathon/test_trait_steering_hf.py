@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-# Tests additive steering using selected-layer trait vectors from Gemma traits40 pipeline.
+# Tests additive steering using selected-layer trait vectors from the Gemma traits40 pipeline.
+# Assumes vectors are saved as Tensor[n_selected_layers, hidden_dim], e.g. [7, 5376],
+# and --vector_layers tells the script which original model layers those rows correspond to.
 
 import argparse
 import random
@@ -24,7 +26,17 @@ NEUTRAL_TEST_PROMPTS = [
     "What makes a good leader?",
 ]
 
-DEFAULT_FRACTIONS = [0.0, 0.05, 0.10, 0.15, 0.20, -0.05, -0.10, -0.15, -0.20]
+DEFAULT_FRACTIONS = [
+    0.0,
+    0.05,
+    0.10,
+    0.15,
+    0.20,
+    -0.05,
+    -0.10,
+    -0.15,
+    -0.20,
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--vector_layers",
         type=str,
         required=True,
-        help="Comma-separated original model layer indices stored in the vector rows, e.g. 15,20,25,30,35,40,45",
+        help="Comma-separated original model layer indices stored in vector rows, e.g. 15,20,25,30,35,40,45",
     )
     ap.add_argument(
         "--layer_index",
@@ -50,14 +62,26 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fractions", type=str, default=",".join(str(x) for x in DEFAULT_FRACTIONS))
     ap.add_argument("--max_new_tokens", type=int, default=160)
     ap.add_argument("--seed", type=int, default=42)
+
     ap.add_argument(
         "--torch_dtype",
         type=str,
         default="bfloat16",
         choices=["float16", "bfloat16", "float32"],
     )
-    ap.add_argument("--calibration_prompts", nargs="*", default=None)
-    ap.add_argument("--test_prompts", nargs="*", default=None)
+
+    ap.add_argument(
+        "--calibration_prompts",
+        nargs="*",
+        default=None,
+        help="Optional prompts used to calibrate residual norms. Defaults to neutral prompts.",
+    )
+    ap.add_argument(
+        "--test_prompts",
+        nargs="*",
+        default=None,
+        help="Optional prompts to test. Defaults to neutral prompts.",
+    )
 
     return ap.parse_args()
 
@@ -115,20 +139,24 @@ def get_layers(model):
     for attr in candidates:
         obj = model
         ok = True
+
         for part in attr.split("."):
             obj = getattr(obj, part, None)
             if obj is None:
                 ok = False
                 break
+
         if ok:
             return obj
 
-    # Generic fallback: find the first ModuleList with length matching text_config.num_hidden_layers.
+    # Generic fallback for Gemma4 and similar wrappers:
+    # find a ModuleList whose length matches text_config.num_hidden_layers.
     target_n = None
     cfg = getattr(model, "config", None)
 
     if cfg is not None:
         text_config = getattr(cfg, "text_config", None)
+
         if text_config is not None:
             target_n = getattr(text_config, "num_hidden_layers", None)
 
@@ -146,6 +174,20 @@ def get_layers(model):
         print(f"  {name}: {type(module)}", flush=True)
 
     raise RuntimeError("Cannot locate transformer layers in model.")
+
+
+def format_chat(tokenizer, prompt: str):
+    messages = [{"role": "user", "content": prompt}]
+
+    enc = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors="pt",
+        return_dict=True,
+    )
+
+    return enc
 
 
 def move_batch_to_device(batch: dict, device):
@@ -179,10 +221,12 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int) -> str:
 
     prompt_len = enc["input_ids"].shape[1]
     text = tokenizer.decode(out[0, prompt_len:], skip_special_tokens=True)
+
     return text.strip()
 
 
 class ResidualNormCalibrator:
+    # Measures average residual-stream norm at the chosen layer output.
     def __init__(self, layer_index: int):
         self.layer_index = int(layer_index)
         self.norm_sum = 0.0
@@ -191,6 +235,7 @@ class ResidualNormCalibrator:
 
     def _hook(self, module, inputs, output):
         hidden = output[0] if isinstance(output, tuple) else output
+
         with torch.no_grad():
             norms = hidden.float().norm(dim=-1)
             self.norm_sum += norms.mean().item()
@@ -207,14 +252,22 @@ class ResidualNormCalibrator:
 
     def calibrate(self, model, tokenizer, prompts: Iterable[str]) -> float:
         self.register(model)
+
         try:
             with torch.no_grad():
                 for prompt in prompts:
                     enc = format_chat(tokenizer, prompt)
+
                     if "attention_mask" not in enc:
                         enc["attention_mask"] = torch.ones_like(enc["input_ids"])
+
                     enc = move_batch_to_device(enc, get_model_device(model))
-                    _ = model(**enc, use_cache=False)
+
+                    _ = model(
+                        **enc,
+                        use_cache=False,
+                    )
+
         finally:
             self.remove()
 
@@ -225,6 +278,7 @@ class ResidualNormCalibrator:
 
 
 class AdditiveSteeringHook:
+    # Adds alpha * residual_norm * unit_vector at every token position of the selected layer output.
     def __init__(
         self,
         selected_layer_vector: torch.Tensor,
@@ -249,6 +303,7 @@ class AdditiveSteeringHook:
 
         if isinstance(output, tuple):
             return (hidden,) + output[1:]
+
         return hidden
 
     def register(self, model):
@@ -298,6 +353,7 @@ def run_test(
                 hook.remove()
 
         coeff = round(frac * layer_residual_norm, 4)
+
         results.append(
             {
                 "fraction": frac,
@@ -336,7 +392,10 @@ def main():
     calibration_prompts = args.calibration_prompts if args.calibration_prompts else list(NEUTRAL_TEST_PROMPTS)
 
     print(f"Loading tokenizer: {args.model_id}", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_id,
+        trust_remote_code=True,
+    )
 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -356,6 +415,7 @@ def main():
             device_map="cuda:0",
             trust_remote_code=True,
         )
+
         model.eval()
 
         for p in model.parameters():
@@ -431,6 +491,7 @@ def main():
 
                 for r in results:
                     print(f"\n  [frac={r['fraction']:+.2f}] coeff={r['coeff']:+.4f}", flush=True)
+
                     if not r["response"]:
                         print("    <empty response>", flush=True)
                     else:
