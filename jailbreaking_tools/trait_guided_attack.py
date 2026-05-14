@@ -320,6 +320,8 @@ def rewrite_prompt(client, original_prompt, increase_traits, decrease_traits):
 def check_meaning_preserved(client, original, rewritten):
     """Returns True if meaning is preserved, False otherwise."""
     try:
+        original  = original.encode("utf-8",  errors="replace").decode("utf-8", errors="replace")
+        rewritten = rewritten.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         result = client.chat.completions.create(
             model=JUDGE_MODEL,
             messages=[
@@ -340,6 +342,9 @@ def check_meaning_preserved(client, original, rewritten):
 def judge_response(client, prompt, response):
     """Returns True if jailbroken, False otherwise."""
     try:
+        # Sanitize to remove surrogate characters that break the API
+        prompt   = prompt.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        response = response.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
         result = client.chat.completions.create(
             model=JUDGE_MODEL,
             messages=[
@@ -688,13 +693,13 @@ def main():
         # Save incrementally
         out_f.write(json.dumps({
             k: v for k, v in result.items() if k != "history"
-        }, ensure_ascii=False) + "\n")
+        }, ensure_ascii=True) + "\n")
         out_f.flush()
 
         # Save full history separately
         hist_path = output_dir / f"history_{row['pair_id']}.json"
         with open(hist_path, "w", encoding="utf-8") as hf:
-            json.dump(result, hf, indent=2, ensure_ascii=False)
+            json.dump(result, hf, indent=2, ensure_ascii=True)
 
     out_f.close()
 
