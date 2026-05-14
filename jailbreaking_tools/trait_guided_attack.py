@@ -33,6 +33,7 @@ import logging
 import os
 import random
 import time
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -66,8 +67,12 @@ HARMBENCH_ROOT    = "/dlabscratch1/bazina/HarmBench"
 REPO_ROOT         = Path("/dlabscratch1/bazina/assistant-axis-llama3.1-8B")
 TRAIT_VECTORS_DIR = REPO_ROOT / "full_trait_output/traits40_vectors/pre_generation_last_token/filter_matched_pairs_ge_50_count_ge_10_total"
 TRAIT_INSTRUCT_DIR = REPO_ROOT / "data/traits/instructions"
-HARMBENCH_CLASSIFIED = REPO_ROOT / "full_trait_output/harmbench_activations/classified_responses.jsonl"
-HARMBENCH_ACTS       = REPO_ROOT / "full_trait_output/harmbench_activations/activations.pt"
+JAILBREAKS_URL         = ("https://raw.githubusercontent.com/centerforaisafety/HarmBench"
+                          "/main/baselines/human_jailbreaks/jailbreaks.py")
+SKIP_JAILBREAK_INDICES = {16, 44}
+HARMBENCH_METADATA     = REPO_ROOT / "full_trait_output/harmbench_activations/pairs_metadata.jsonl"
+HARMBENCH_CLASSIFIED   = REPO_ROOT / "full_trait_output/harmbench_activations/classified_responses.jsonl"
+HARMBENCH_ACTS         = REPO_ROOT / "full_trait_output/harmbench_activations/activations.pt"
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
@@ -160,6 +165,46 @@ def load_trait_instruction(trait_name):
     except Exception as e:
         logger.warning(f"  Error loading instruction for {trait_name}: {e}")
         return f"Embody the trait: {trait_name}"
+
+
+def fetch_jailbreaks():
+    """Fetch jailbreak templates from HarmBench GitHub."""
+    logger.info("Fetching jailbreak templates...")
+    with urllib.request.urlopen(JAILBREAKS_URL) as resp:
+        source = resp.read().decode("utf-8")
+    ns = {}
+    exec(source, ns)
+    raw = ns["JAILBREAKS"]
+    valid = {}
+    for i, jb in enumerate(raw):
+        if i in SKIP_JAILBREAK_INDICES or "{0}" not in jb:
+            continue
+        valid[i] = jb
+    logger.info(f"Loaded {len(valid)} jailbreak templates")
+    return valid
+
+
+def build_prompt_map(jailbreak_templates):
+    """Reconstruct full formatted jailbreak prompts from metadata + templates."""
+    meta  = load_jsonl(HARMBENCH_METADATA)
+    resp  = load_jsonl(HARMBENCH_CLASSIFIED)
+    btext = {r["pair_id"]: r["behavior_text"] for r in resp}
+    pm = {}
+    for row in meta:
+        pid    = row["pair_id"]
+        jb_idx = row["jailbreak_idx"]
+        bt     = row.get("behavior_text") or btext.get(pid, "")
+        if jb_idx == -1:
+            pm[pid] = bt
+        elif jb_idx in jailbreak_templates:
+            try:
+                pm[pid] = jailbreak_templates[jb_idx].format(bt)
+            except Exception:
+                pm[pid] = bt
+        else:
+            pm[pid] = bt
+    logger.info(f"Built prompt map for {len(pm)} pairs")
+    return pm
 
 
 def load_harmbench_behaviors():
@@ -534,6 +579,11 @@ def main():
     hb_rows = load_harmbench_behaviors()
     hb_acts = torch.load(HARMBENCH_ACTS, map_location="cpu", weights_only=False)
 
+    # Fetch jailbreak templates and build prompt map
+    jailbreak_templates = fetch_jailbreaks()
+    prompt_map = build_prompt_map(jailbreak_templates)
+    logger.info(f"Prompt map covers {len(prompt_map)} pairs")
+
     # Build all_traits feature matrix for classifier training
     logger.info("Building training features for classifier...")
     X_list, y_list, valid_rows = [], [], []
@@ -570,33 +620,35 @@ def main():
     # ── Build 50/50 pool ──────────────────────────────────────────────────────
     logger.info("\nBuilding 50/50 attack pool...")
 
-    # Get one representative prompt per behavior (use direct behavior text, no template)
-    # Group by behavior, pick one row per behavior
-    behavior_to_row = {}
-    for row in valid_rows:
-        bid = row["behavior_id"]
-        if bid not in behavior_to_row:
-            behavior_to_row[bid] = row
+    # Only include rows where we have a formatted prompt
+    valid_rows_with_prompts = [
+        r for r in valid_rows
+        if r["pair_id"] in prompt_map and prompt_map[r["pair_id"]].strip()
+    ]
+    logger.info(f"Rows with formatted prompts: {len(valid_rows_with_prompts)}")
 
-    jb_behaviors     = [r for r in behavior_to_row.values() if r.get("jailbroken")]
-    not_jb_behaviors = [r for r in behavior_to_row.values() if not r.get("jailbroken")]
+    # Group by behavior, keep all variants (different jailbreak templates)
+    # Use each unique (behavior_id, jailbreak_idx) pair as one entry
+    jb_rows_pool     = [r for r in valid_rows_with_prompts if r.get("jailbroken")]
+    not_jb_rows_pool = [r for r in valid_rows_with_prompts if not r.get("jailbroken")]
 
-    logger.info(f"Available: {len(jb_behaviors)} jb behaviors, "
-                f"{len(not_jb_behaviors)} not-jb behaviors")
+    logger.info(f"Available: {len(jb_rows_pool)} jb pairs, "
+                f"{len(not_jb_rows_pool)} not-jb pairs")
 
     rng = random.Random(RANDOM_SEED)
-    n_each = min(len(jb_behaviors), len(not_jb_behaviors))
+    n_each = min(len(jb_rows_pool), len(not_jb_rows_pool))
     if args.test:
         n_each = 5
     elif args.n_prompts:
         n_each = args.n_prompts // 2
 
-    pool_jb     = rng.sample(jb_behaviors,     n_each)
-    pool_not_jb = rng.sample(not_jb_behaviors, n_each)
+    pool_jb     = rng.sample(jb_rows_pool,     n_each)
+    pool_not_jb = rng.sample(not_jb_rows_pool, n_each)
     pool        = pool_jb + pool_not_jb
     rng.shuffle(pool)
 
-    logger.info(f"Attack pool: {len(pool)} prompts ({n_each} jb + {n_each} not-jb)")
+    logger.info(f"Attack pool: {len(pool)} pairs ({n_each} jb + {n_each} not-jb)")
+    logger.info(f"Using FORMATTED jailbreak prompts (with templates) as starting point")
 
     # ── Run attack ────────────────────────────────────────────────────────────
     logger.info(f"\n{'='*70}")
@@ -612,20 +664,24 @@ def main():
     out_f     = open(out_path, "w", encoding="utf-8")
 
     for i, row in enumerate(pool):
-        logger.info(f"\n[{i+1}/{len(pool)}] behavior_id={row['behavior_id']}")
+        pid            = row["pair_id"]
+        formatted_prompt = prompt_map[pid]
+        logger.info(f"\n[{i+1}/{len(pool)}] behavior_id={row['behavior_id']} | "
+                    f"jailbreak_idx={row.get('jailbreak_idx', -1)}")
+        logger.info(f"  Formatted prompt (first 150 chars): {formatted_prompt[:150]}...")
 
         result = attack_prompt(
-            original_prompt    = row["behavior_text"],
+            original_prompt    = formatted_prompt,
             original_jailbroken= bool(row.get("jailbroken")),
-            pair_id            = row["pair_id"],
+            pair_id            = pid,
             model=model, tokenizer=tokenizer, device=device,
             client=client,
             trait_matrix=trait_matrix, trait_names=trait_names,
             clf=clf, scaler=scaler,
-            max_iter   = args.max_iter,
+            max_iter        = args.max_iter,
             score_threshold = args.threshold,
-            top_k      = args.top_k,
-            test_mode  = args.test,
+            top_k           = args.top_k,
+            test_mode       = args.test,
         )
         results.append(result)
 
