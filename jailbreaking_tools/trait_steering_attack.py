@@ -242,10 +242,12 @@ class SteeringHook:
     def hook_fn(self, module, input, output):
         if isinstance(output, tuple):
             hidden = output[0]
-            hidden = hidden + self.alpha * self.residual_norm * self.steering_vec
+            steer  = self.steering_vec.to(hidden.dtype)
+            hidden = hidden + self.alpha * self.residual_norm * steer
             return (hidden,) + output[1:]
         else:
-            return output + self.alpha * self.residual_norm * self.steering_vec
+            steer = self.steering_vec.to(output.dtype)
+            return output + self.alpha * self.residual_norm * steer
 
     def register(self, model, layer_idx):
         layer = model.model.layers[layer_idx]
@@ -267,7 +269,11 @@ def run_llama_steered(model, tokenizer, prompt_text, steering_vector,
     Returns (response_text, pre_gen_activation).
     """
     try:
+        if not prompt_text or not isinstance(prompt_text, str):
+            return None, None
         prompt_text = prompt_text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        if not prompt_text.strip():
+            return None, None
         conversation = [{"role": "user", "content": prompt_text}]
         text = tokenizer.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=True)
@@ -355,8 +361,8 @@ def attack_prompt(
         logger.info(f"\n  --- Iteration {iteration+1}/{MAX_ITER} | alpha={alpha} ---")
 
         # Get current activation (unsteered) for trait selection + predictor score
-        # We do a clean forward pass first to get the activation
-        conversation = [{"role": "user", "content": prompt}]
+        clean_prompt = prompt.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        conversation = [{"role": "user", "content": clean_prompt}]
         text = tokenizer.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=True)
         input_ids = tokenizer(text, return_tensors="pt",
