@@ -359,7 +359,13 @@ def score_prompts_fjd(rows_by_name, prompt_maps, args):
         logger.info(f"Loading cached FJD scores: {cache_path}")
         with open(cache_path) as f:
             cached = json.load(f)
-        return {name: np.array(cached[name]["scores"], dtype=float) for name in cached}
+        cache_ok = all(
+            name in cached and len(cached[name].get("scores", [])) == len(rows)
+            for name, rows in rows_by_name.items()
+        )
+        if cache_ok:
+            return {name: np.array(cached[name]["scores"], dtype=float) for name in cached}
+        logger.warning("Cached FJD scores do not match current dataset sizes; recomputing.")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Loading {args.model} for FJD-style compliance scores...")
