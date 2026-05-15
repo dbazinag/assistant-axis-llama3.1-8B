@@ -6,8 +6,8 @@ GradSafe implementation faithful to Xie et al. (ACL 2024).
 
 Key differences from naive gradient-norm approach:
   - Reference gradient = average gradient over a small calibration jailbreak set
-  - Scoring = cosine similarity between candidate gradient and reference (row+col)
-  - Critical param selection = params with largest unsafe-safe gap in cosine similarity
+  - Critical slice selection = row/column unsafe-safe cosine gap > 1
+  - Scoring = mean candidate/reference cosine over those critical row/column slices
   - Gradients kept as 2D matrices, NOT flattened — much more memory efficient
   - Calibration set: ~10 jailbreak + ~10 benign prompts (paper uses 2+2)
 
@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -44,6 +44,7 @@ COMPLIANCE_TARGET      = "Sure"
 TRAIN_FRAC             = 0.7
 RANDOM_SEED            = 42
 N_CALIB                = 20   # jailbreak + benign prompts each for calibration
+CRITICAL_GAP_THRESHOLD = 1.0  # official GradSafe code uses row/col gap > 1
 JAILBREAKS_URL         = ("https://raw.githubusercontent.com/centerforaisafety/HarmBench"
                           "/main/baselines/human_jailbreaks/jailbreaks.py")
 SKIP_JAILBREAK_INDICES = {16, 44}
@@ -201,7 +202,7 @@ def compute_gradient(model, tokenizer, prompt_text, device):
 
         grads = {}
         for name, param in model.named_parameters():
-            if param.grad is not None and ("mlp" in name or "self_attn" in name):
+            if param.grad is not None and ("mlp" in name or "self" in name):
                 # Keep as 2D — same as paper
                 g = param.grad.detach().float()
                 if g.dim() == 1:
@@ -246,15 +247,13 @@ def divide_gradient_sum(grad_sum, count):
     return {name: g.div(count) for name, g in grad_sum.items()}
 
 
-def cosine_similarity_score(grads_candidate, grads_reference, critical_params):
+def cosine_similarity_score(grads_candidate, grads_reference, critical_masks):
     """
-    Score a candidate prompt by computing row+col cosine similarity
-    with the reference gradient, summed over critical parameters.
-    Matches the paper's scoring approach exactly.
+    Score a candidate prompt by averaging row/column cosine similarities over
+    safety-critical row/column slices, matching the official GradSafe code.
     """
-    total_score = 0.0
-    n = 0
-    for name in critical_params:
+    cos_values = []
+    for name, masks in critical_masks.items():
         if name not in grads_candidate or name not in grads_reference:
             continue
         g_cand = grads_candidate[name].to(grads_reference[name].device)
@@ -262,11 +261,17 @@ def cosine_similarity_score(grads_candidate, grads_reference, critical_params):
 
         row_cos = torch.nan_to_num(F.cosine_similarity(g_cand, g_ref, dim=1))
         col_cos = torch.nan_to_num(F.cosine_similarity(g_cand, g_ref, dim=0))
+        row_mask = masks["row"].to(row_cos.device)
+        col_mask = masks["col"].to(col_cos.device)
 
-        total_score += float(row_cos.mean() + col_cos.mean())
-        n += 1
+        if row_mask.any():
+            cos_values.extend(row_cos[row_mask].cpu().tolist())
+        if col_mask.any():
+            cos_values.extend(col_cos[col_mask].cpu().tolist())
 
-    return total_score / max(n, 1)
+    if not cos_values:
+        return float("nan")
+    return float(np.mean(cos_values))
 
 
 # ── AUC ────────────────────────────────────────────────────────────────────────
@@ -285,6 +290,12 @@ def balanced_auc(scores, y):
     return max(auc, 1 - auc)
 
 
+def average_precision(scores, y):
+    if len(scores) == 0 or len(set(y)) < 2:
+        return float("nan")
+    return average_precision_score(y, scores)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -293,6 +304,8 @@ def main():
     parser.add_argument("--output_dir", default="full_trait_output/baselines_all_attacks")
     parser.add_argument("--n_calib",    type=int, default=N_CALIB,
                         help="Number of jailbreak + benign prompts for calibration each")
+    parser.add_argument("--critical_gap_threshold", type=float, default=CRITICAL_GAP_THRESHOLD,
+                        help="Row/column unsafe-safe cosine gap threshold for safety-critical slices")
     parser.add_argument("--device",     default="cuda")
     parser.add_argument("--test",       action="store_true")
     args = parser.parse_args()
@@ -367,8 +380,9 @@ def main():
     # ── Step 2: Find critical params via unsafe-safe cosine gap ───────────────
     logger.info(f"\n=== Step 2: Critical parameter selection ({len(calib_benign)} benign) ===")
 
-    # Average row+col cosine of jb with reference
-    jb_cos = {name: 0.0 for name in reference_grad}
+    # Average row/column cosine of jb with reference
+    jb_row_cos = {}
+    jb_col_cos = {}
     for i, row in enumerate(calib_jb):
         logger.info(f"  JB gap calib {i+1}/{len(calib_jb)}")
         prompt = hb_pm.get(row["pair_id"], "")
@@ -382,14 +396,24 @@ def main():
                 continue
             gc = g[name].to(reference_grad[name].device)
             gr = reference_grad[name]
-            row_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=1)).mean().item()
-            col_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=0)).mean().item()
-            jb_cos[name] += (row_cos + col_cos) / n_jb_grads
+            row_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=1)).cpu()
+            col_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=0)).cpu()
+            if name not in jb_row_cos:
+                jb_row_cos[name] = row_cos
+                jb_col_cos[name] = col_cos
+            else:
+                jb_row_cos[name].add_(row_cos)
+                jb_col_cos[name].add_(col_cos)
         del g
         torch.cuda.empty_cache()
 
-    # Average row+col cosine of benign with reference
-    benign_cos = {name: 0.0 for name in reference_grad}
+    for name in jb_row_cos:
+        jb_row_cos[name].div_(n_jb_grads)
+        jb_col_cos[name].div_(n_jb_grads)
+
+    # Average row/column cosine of benign with reference
+    benign_row_cos = {}
+    benign_col_cos = {}
     n_benign_grads = 0
     for i, row in enumerate(calib_benign):
         logger.info(f"  Benign calib {i+1}/{len(calib_benign)}")
@@ -404,33 +428,57 @@ def main():
                     continue
                 gc = g[name].to(reference_grad[name].device)
                 gr = reference_grad[name]
-                row_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=1)).mean().item()
-                col_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=0)).mean().item()
-                benign_cos[name] += (row_cos + col_cos)
+                row_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=1)).cpu()
+                col_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=0)).cpu()
+                if name not in benign_row_cos:
+                    benign_row_cos[name] = row_cos
+                    benign_col_cos[name] = col_cos
+                else:
+                    benign_row_cos[name].add_(row_cos)
+                    benign_col_cos[name].add_(col_cos)
             del g
             torch.cuda.empty_cache()
 
-    for name in benign_cos:
+    for name in benign_row_cos:
         if n_benign_grads:
-            benign_cos[name] /= n_benign_grads
+            benign_row_cos[name].div_(n_benign_grads)
+            benign_col_cos[name].div_(n_benign_grads)
 
-    # Critical params: largest unsafe-safe gap
-    gap = {name: jb_cos[name] - benign_cos[name] for name in reference_grad}
-    sorted_params = sorted(gap.keys(), key=lambda n: gap[n], reverse=True)
-    n_critical = max(1, len(sorted_params) // 5)  # top 20%
-    critical_params = set(sorted_params[:n_critical])
+    # Safety-critical slices: official GradSafe selects row/column entries where
+    # unsafe-safe cosine gap exceeds 1.
+    critical_masks = {}
+    n_critical_rows = 0
+    n_critical_cols = 0
+    for name in jb_row_cos:
+        if name not in benign_row_cos:
+            continue
+        row_gap = jb_row_cos[name] - benign_row_cos[name]
+        col_gap = jb_col_cos[name] - benign_col_cos[name]
+        row_mask = row_gap > args.critical_gap_threshold
+        col_mask = col_gap > args.critical_gap_threshold
+        if row_mask.any() or col_mask.any():
+            critical_masks[name] = {"row": row_mask, "col": col_mask}
+            n_critical_rows += int(row_mask.sum().item())
+            n_critical_cols += int(col_mask.sum().item())
 
-    logger.info(f"  Critical params: {len(critical_params)}/{len(sorted_params)}")
-    logger.info(f"  Top 5: {sorted_params[:5]}")
+    if not critical_masks:
+        logger.error("No safety-critical row/column slices selected — exiting")
+        return
+
+    logger.info(f"  Critical params: {len(critical_masks)}/{len(jb_row_cos)}")
+    logger.info(f"  Critical slices: {n_critical_rows} rows + {n_critical_cols} cols")
+    logger.info(f"  Gap threshold: {args.critical_gap_threshold}")
 
     # Save calibration results
     with open(output_dir / "gradsafe_calibration.json", "w") as f:
         json.dump({
             "n_jb_calib": n_jb_grads,
             "n_benign_calib": n_benign_grads,
-            "n_critical_params": len(critical_params),
-            "critical_params": list(critical_params),
-            "top_gap_params": sorted_params[:10],
+            "critical_gap_threshold": args.critical_gap_threshold,
+            "n_critical_params": len(critical_masks),
+            "n_critical_rows": n_critical_rows,
+            "n_critical_cols": n_critical_cols,
+            "critical_params": list(critical_masks),
         }, f, indent=2)
 
     # ── Step 3: Score all datasets ─────────────────────────────────────────────
@@ -458,14 +506,17 @@ def main():
             g = compute_gradient(model, tokenizer, prompt, device)
             if g is None:
                 continue
-            score = cosine_similarity_score(g, reference_grad, critical_params)
+            score = cosine_similarity_score(g, reference_grad, critical_masks)
+            if np.isnan(score):
+                continue
             scores_list.append(score)
             y_list.append(1 if jb else 0)
 
         y   = np.array(y_list)
         auc = balanced_auc(scores_list, y)
-        logger.info(f"  {name}: {len(y)} pairs, {y.sum():.0f} jb, AUC={auc:.4f}")
-        return auc, len(y), int(y.sum())
+        ap = average_precision(scores_list, y)
+        logger.info(f"  {name}: {len(y)} pairs, {y.sum():.0f} jb, AUC={auc:.4f}, AP={ap:.4f}")
+        return auc, ap, len(y), int(y.sum())
 
     results = {}
     for name, cfg in DATASETS.items():
@@ -476,29 +527,34 @@ def main():
         rows = load_jsonl(cfg["responses"])
         pm   = hb_pm if name == "HarmBench" else build_prompt_map_generic(rows, cfg["test_cases"])
         ft   = "human_jailbreak" if name == "HarmBench" else None
-        auc, n, n_jb = score_dataset(name, rows, pm, ft)
-        results[name] = {"n": n, "n_jb": n_jb, "auc": auc}
+        auc, ap, n, n_jb = score_dataset(name, rows, pm, ft)
+        results[name] = {"n": n, "n_jb": n_jb, "auc": auc, "average_precision": ap}
 
     # ── Summary ────────────────────────────────────────────────────────────────
     sep = "=" * 70
     print(f"\n{sep}")
     print(f"  GRADSAFE (paper implementation) — ALL ATTACK FAMILIES")
     print(f"  Calib: {n_jb_grads} jb + {n_benign_grads} benign | "
-          f"{len(critical_params)} critical params")
-    print(f"  Balanced AUC (50/50, best direction)")
+          f"{len(critical_masks)} critical params | "
+          f"{n_critical_rows + n_critical_cols} critical slices")
+    print(f"  Balanced AUC (50/50, best direction) + AP")
     print(sep)
-    print(f"  {'Family':12s}  {'N':>6}  {'JB%':>6}  {'AUC':>8}")
-    print("  " + "─" * 38)
+    print(f"  {'Family':12s}  {'N':>6}  {'JB%':>6}  {'AUC':>8}  {'AP':>8}")
+    print("  " + "─" * 48)
     for name, r in results.items():
         rate = r["n_jb"] / r["n"] if r["n"] > 0 else 0
-        print(f"  {name:12s}  {r['n']:>6}  {rate:>6.1%}  {r['auc']:>8.4f}")
+        print(f"  {name:12s}  {r['n']:>6}  {rate:>6.1%}  "
+              f"{r['auc']:>8.4f}  {r['average_precision']:>8.4f}")
     print(sep)
 
     with open(output_dir / "gradsafe_all_attacks.json", "w") as f:
         json.dump({
             "n_jb_calib": n_jb_grads,
             "n_benign_calib": n_benign_grads,
-            "n_critical_params": len(critical_params),
+            "critical_gap_threshold": args.critical_gap_threshold,
+            "n_critical_params": len(critical_masks),
+            "n_critical_rows": n_critical_rows,
+            "n_critical_cols": n_critical_cols,
             "results": results,
         }, f, indent=2)
     logger.info(f"Saved to {output_dir}/gradsafe_all_attacks.json")
