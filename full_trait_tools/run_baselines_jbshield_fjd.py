@@ -50,6 +50,7 @@ TRAIN_FRAC             = 0.7
 N_SEEDS                = 50
 RANDOM_SEED            = 42
 LAYER                  = 16
+TEST_ROWS_PER_DATASET  = 200
 
 DATASETS = {
     "HarmBench": {
@@ -160,6 +161,17 @@ def filter_rows(name: str, rows: List[dict]) -> List[dict]:
     if filter_type:
         rows = [r for r in rows if r.get("attack_type") == filter_type]
     return rows
+
+
+def test_subset(rows: List[dict], n: int = TEST_ROWS_PER_DATASET) -> List[dict]:
+    if len(rows) <= n:
+        return rows
+    positives = [r for r in rows if r.get("jailbroken")]
+    negatives = [r for r in rows if not r.get("jailbroken")]
+    half = n // 2
+    if len(positives) >= half and len(negatives) >= n - half:
+        return positives[:half] + negatives[: n - half]
+    return rows[:n]
 
 
 def get_pool_split(rows, train_frac, seed):
@@ -472,7 +484,7 @@ def main():
             continue
         rows = filter_rows(name, load_jsonl(rows_path))
         if args.test:
-            rows = rows[:20]
+            rows = test_subset(rows)
         rows_by_name[name] = rows
         if name == "HarmBench":
             prompt_maps[name] = build_prompt_map_harmbench(
