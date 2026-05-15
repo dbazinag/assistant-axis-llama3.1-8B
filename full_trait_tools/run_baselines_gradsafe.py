@@ -233,6 +233,19 @@ def average_gradients(grad_list):
     return avg
 
 
+def add_to_gradient_sum(grad_sum, grads):
+    """Accumulate gradients without retaining every calibration example."""
+    for name, g in grads.items():
+        if name not in grad_sum:
+            grad_sum[name] = g.clone()
+        else:
+            grad_sum[name].add_(g.to(grad_sum[name].device))
+
+
+def divide_gradient_sum(grad_sum, count):
+    return {name: g.div(count) for name, g in grad_sum.items()}
+
+
 def cosine_similarity_score(grads_candidate, grads_reference, critical_params):
     """
     Score a candidate prompt by computing row+col cosine similarity
@@ -329,7 +342,8 @@ def main():
 
     # ── Step 1: Compute reference gradient (avg over calibration jailbreaks) ──
     logger.info(f"\n=== Step 1: Reference gradient ({len(calib_jb)} jb prompts) ===")
-    jb_grads = []
+    jb_grad_sum = {}
+    n_jb_grads = 0
     for i, row in enumerate(calib_jb):
         logger.info(f"  JB calib {i+1}/{len(calib_jb)}")
         prompt = hb_pm.get(row["pair_id"], "")
@@ -337,13 +351,17 @@ def main():
             continue
         g = compute_gradient(model, tokenizer, prompt, device)
         if g is not None:
-            jb_grads.append(g)
+            add_to_gradient_sum(jb_grad_sum, g)
+            n_jb_grads += 1
+            del g
+            torch.cuda.empty_cache()
 
-    if not jb_grads:
+    if not n_jb_grads:
         logger.error("No calibration gradients computed — exiting")
         return
 
-    reference_grad = average_gradients(jb_grads)
+    reference_grad = divide_gradient_sum(jb_grad_sum, n_jb_grads)
+    del jb_grad_sum
     logger.info(f"  Reference gradient: {len(reference_grad)} parameters")
 
     # ── Step 2: Find critical params via unsafe-safe cosine gap ───────────────
@@ -351,7 +369,14 @@ def main():
 
     # Average row+col cosine of jb with reference
     jb_cos = {name: 0.0 for name in reference_grad}
-    for g in jb_grads:
+    for i, row in enumerate(calib_jb):
+        logger.info(f"  JB gap calib {i+1}/{len(calib_jb)}")
+        prompt = hb_pm.get(row["pair_id"], "")
+        if not prompt:
+            continue
+        g = compute_gradient(model, tokenizer, prompt, device)
+        if g is None:
+            continue
         for name in reference_grad:
             if name not in g:
                 continue
@@ -359,11 +384,13 @@ def main():
             gr = reference_grad[name]
             row_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=1)).mean().item()
             col_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=0)).mean().item()
-            jb_cos[name] += (row_cos + col_cos) / len(jb_grads)
+            jb_cos[name] += (row_cos + col_cos) / n_jb_grads
+        del g
+        torch.cuda.empty_cache()
 
     # Average row+col cosine of benign with reference
     benign_cos = {name: 0.0 for name in reference_grad}
-    benign_grads = []
+    n_benign_grads = 0
     for i, row in enumerate(calib_benign):
         logger.info(f"  Benign calib {i+1}/{len(calib_benign)}")
         prompt = hb_pm.get(row["pair_id"], "")
@@ -371,7 +398,7 @@ def main():
             continue
         g = compute_gradient(model, tokenizer, prompt, device)
         if g is not None:
-            benign_grads.append(g)
+            n_benign_grads += 1
             for name in reference_grad:
                 if name not in g:
                     continue
@@ -380,10 +407,12 @@ def main():
                 row_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=1)).mean().item()
                 col_cos = torch.nan_to_num(F.cosine_similarity(gc, gr, dim=0)).mean().item()
                 benign_cos[name] += (row_cos + col_cos)
+            del g
+            torch.cuda.empty_cache()
 
     for name in benign_cos:
-        if benign_grads:
-            benign_cos[name] /= len(benign_grads)
+        if n_benign_grads:
+            benign_cos[name] /= n_benign_grads
 
     # Critical params: largest unsafe-safe gap
     gap = {name: jb_cos[name] - benign_cos[name] for name in reference_grad}
@@ -397,8 +426,8 @@ def main():
     # Save calibration results
     with open(output_dir / "gradsafe_calibration.json", "w") as f:
         json.dump({
-            "n_jb_calib": len(jb_grads),
-            "n_benign_calib": len(benign_grads),
+            "n_jb_calib": n_jb_grads,
+            "n_benign_calib": n_benign_grads,
             "n_critical_params": len(critical_params),
             "critical_params": list(critical_params),
             "top_gap_params": sorted_params[:10],
@@ -454,7 +483,7 @@ def main():
     sep = "=" * 70
     print(f"\n{sep}")
     print(f"  GRADSAFE (paper implementation) — ALL ATTACK FAMILIES")
-    print(f"  Calib: {len(jb_grads)} jb + {len(benign_grads)} benign | "
+    print(f"  Calib: {n_jb_grads} jb + {n_benign_grads} benign | "
           f"{len(critical_params)} critical params")
     print(f"  Balanced AUC (50/50, best direction)")
     print(sep)
@@ -467,8 +496,8 @@ def main():
 
     with open(output_dir / "gradsafe_all_attacks.json", "w") as f:
         json.dump({
-            "n_jb_calib": len(jb_grads),
-            "n_benign_calib": len(benign_grads),
+            "n_jb_calib": n_jb_grads,
+            "n_benign_calib": n_benign_grads,
             "n_critical_params": len(critical_params),
             "results": results,
         }, f, indent=2)
