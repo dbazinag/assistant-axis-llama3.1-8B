@@ -29,7 +29,8 @@ from typing import Callable
 
 import numpy as np
 import torch
-from sklearn.ensemble import ExtraTreesClassifier, GradientBoostingClassifier
+from sklearn.decomposition import PCA
+from sklearn.ensemble import ExtraTreesClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -52,6 +53,42 @@ class ModelSpec:
     builder: Callable[[int], object]
 
 
+class AverageScoreEnsemble:
+    """Average standardized decision scores from a small fixed model set."""
+
+    def __init__(self, builders: list[Callable[[int], object]], seed: int):
+        self.builders = builders
+        self.seed = seed
+        self.models = []
+        self.means = []
+        self.stds = []
+
+    @staticmethod
+    def _score(model, x: np.ndarray) -> np.ndarray:
+        if hasattr(model, "predict_proba"):
+            return model.predict_proba(x)[:, 1]
+        return model.decision_function(x)
+
+    def fit(self, x: np.ndarray, y: np.ndarray):
+        self.models = []
+        self.means = []
+        self.stds = []
+        for offset, builder in enumerate(self.builders):
+            model = builder(self.seed + offset)
+            model.fit(x, y)
+            score = self._score(model, x)
+            self.models.append(model)
+            self.means.append(float(np.mean(score)))
+            self.stds.append(float(np.std(score) + 1e-8))
+        return self
+
+    def decision_function(self, x: np.ndarray) -> np.ndarray:
+        scores = []
+        for model, mean, std in zip(self.models, self.means, self.stds):
+            scores.append((self._score(model, x) - mean) / std)
+        return np.mean(np.stack(scores, axis=0), axis=0)
+
+
 # ── Data loading ───────────────────────────────────────────────────────────────
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -69,7 +106,50 @@ def load_activations(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def load_trait_matrix(layer: int) -> tuple[np.ndarray, list[str]]:
+def load_trait_matrix(
+    layer: int,
+    vectors_dir: Path | None = None,
+    cache_dir: Path | None = None,
+    row_index: int | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    # The trait .pt files store `vector` as a [n_saved_layers x hidden] tensor; `layer`
+    # selects the row. When the saved tensor isn't indexed by absolute layer number
+    # (e.g. Gemma layer30_only vectors store a single row 0 == model layer 30), pass
+    # row_index to pick the row directly while `layer` still keys the activations.
+    idx = row_index if row_index is not None else layer
+    if vectors_dir is not None:
+        # Build from .pt trait vector files; cache in output dir for speed.
+        cache_dir = cache_dir or Path("full_trait_output")
+        mat_path   = cache_dir / f"trait_matrix_layer{layer}.npy"
+        names_path = cache_dir / f"trait_names_layer{layer}.json"
+        if mat_path.exists() and names_path.exists():
+            print(f"  Loading cached OLMo trait matrix from {mat_path}", flush=True)
+            matrix = np.load(mat_path).astype(np.float32)
+            names  = json.loads(names_path.read_text())
+        else:
+            print(f"  Building trait matrix from {vectors_dir} ...", flush=True)
+            vecs, names = [], []
+            for pt_file in sorted(Path(vectors_dir).glob("*.pt")):
+                try:
+                    data = torch.load(pt_file, map_location="cpu", weights_only=False)
+                    v = data["vector"][idx].float().numpy()
+                    norm = np.linalg.norm(v)
+                    if norm > 1e-8:
+                        vecs.append(v / norm)
+                        names.append(pt_file.stem)
+                except Exception as e:
+                    print(f"  Warning: skipping {pt_file.name}: {e}", flush=True)
+            if not vecs:
+                raise ValueError(f"No valid trait vectors found in {vectors_dir}")
+            matrix = np.stack(vecs).astype(np.float32)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            np.save(mat_path, matrix)
+            names_path.write_text(json.dumps(names))
+            print(f"  Cached {len(names)} trait vectors → {mat_path}", flush=True)
+        norms  = np.linalg.norm(matrix, axis=1, keepdims=True)
+        matrix = matrix / np.maximum(norms, 1e-12)
+        return matrix, names
+
     mat_path   = Path(f"full_trait_output/trait_matrix_layer{layer}.npy")
     names_path = Path(f"full_trait_output/trait_names_layer{layer}.json")
     if not mat_path.exists() or not names_path.exists():
@@ -194,31 +274,43 @@ def eval_set(
 def build_specs(include_slow: bool) -> list[ModelSpec]:
     specs: list[ModelSpec] = []
 
+    def logreg_l2(C: float, class_weight):
+        return lambda seed: Pipeline([
+            ("sc", StandardScaler()),
+            ("clf", LogisticRegression(
+                C=C, penalty="l2", solver="lbfgs",
+                max_iter=4000, class_weight=class_weight, random_state=seed,
+            )),
+        ])
+
+    def logreg_l1(C: float, class_weight):
+        return lambda seed: Pipeline([
+            ("sc", StandardScaler()),
+            ("clf", LogisticRegression(
+                C=C, penalty="l1", solver="liblinear",
+                max_iter=4000, class_weight=class_weight, random_state=seed,
+            )),
+        ])
+
+    def linsvm(C: float, class_weight):
+        return lambda seed: Pipeline([
+            ("sc", StandardScaler()),
+            ("clf", LinearSVC(
+                C=C, class_weight=class_weight, max_iter=10000, random_state=seed,
+            )),
+        ])
+
     # Logistic regression — L2, wide C range, balanced and unbalanced
     for C in [0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]:
         for cw in ["balanced", None]:
             tag = f"logreg_l2_C{C}_{'bal' if cw else 'raw'}"
-            _C, _cw = C, cw
-            specs.append(ModelSpec(tag, lambda seed, C=_C, cw=_cw: Pipeline([
-                ("sc", StandardScaler()),
-                ("clf", LogisticRegression(
-                    C=C, penalty="l2", solver="lbfgs",
-                    max_iter=4000, class_weight=cw, random_state=seed,
-                )),
-            ])))
+            specs.append(ModelSpec(tag, logreg_l2(C, cw)))
 
     # Logistic regression — L1
     for C in [0.01, 0.03, 0.1, 0.3, 1.0]:
         for cw in ["balanced", None]:
             tag = f"logreg_l1_C{C}_{'bal' if cw else 'raw'}"
-            _C, _cw = C, cw
-            specs.append(ModelSpec(tag, lambda seed, C=_C, cw=_cw: Pipeline([
-                ("sc", StandardScaler()),
-                ("clf", LogisticRegression(
-                    C=C, penalty="l1", solver="liblinear",
-                    max_iter=4000, class_weight=cw, random_state=seed,
-                )),
-            ])))
+            specs.append(ModelSpec(tag, logreg_l1(C, cw)))
 
     # Logistic regression — ElasticNet
     for C in [0.03, 0.1, 0.3]:
@@ -237,13 +329,30 @@ def build_specs(include_slow: bool) -> list[ModelSpec]:
     for C in [0.003, 0.01, 0.03, 0.1, 0.3, 1.0]:
         for cw in ["balanced", None]:
             tag = f"linsvm_C{C}_{'bal' if cw else 'raw'}"
-            _C, _cw = C, cw
-            specs.append(ModelSpec(tag, lambda seed, C=_C, cw=_cw: Pipeline([
-                ("sc", StandardScaler()),
-                ("clf", LinearSVC(
-                    C=C, class_weight=cw, max_iter=10000, random_state=seed,
-                )),
-            ])))
+            specs.append(ModelSpec(tag, linsvm(C, cw)))
+
+    linear_auc_builders = [
+        logreg_l2(10.0, None),
+        logreg_l2(3.0, None),
+        linsvm(0.3, "balanced"),
+        linsvm(1.0, "balanced"),
+        logreg_l1(1.0, None),
+    ]
+    linear_balanced_builders = [
+        logreg_l2(3.0, None),
+        logreg_l2(3.0, "balanced"),
+        linsvm(0.3, "balanced"),
+        linsvm(0.3, None),
+        logreg_l1(1.0, None),
+    ]
+    specs.append(ModelSpec(
+        "ensemble_linear_auc_top",
+        lambda seed: AverageScoreEnsemble(linear_auc_builders, seed),
+    ))
+    specs.append(ModelSpec(
+        "ensemble_linear_bacc_top",
+        lambda seed: AverageScoreEnsemble(linear_balanced_builders, seed),
+    ))
 
     # Extra Trees
     for n_est, min_leaf in [(300, 2), (300, 5), (500, 3)]:
@@ -275,6 +384,14 @@ def build_specs(include_slow: bool) -> list[ModelSpec]:
         specs.append(ModelSpec(tag, lambda seed, n=_n, lr=_lr, d=_d: GradientBoostingClassifier(
             n_estimators=n, learning_rate=lr, max_depth=d,
             subsample=0.8, random_state=seed,
+        )))
+
+    for max_iter, lr, max_leaf in [(200, 0.04, 15), (300, 0.03, 31), (200, 0.06, 31)]:
+        tag = f"histgb_{max_iter}_lr{lr}_leaf{max_leaf}"
+        _it, _lr, _leaf = max_iter, lr, max_leaf
+        specs.append(ModelSpec(tag, lambda seed, it=_it, lr=_lr, leaf=_leaf: HistGradientBoostingClassifier(
+            max_iter=it, learning_rate=lr, max_leaf_nodes=leaf,
+            l2_regularization=0.05, random_state=seed,
         )))
 
     # RBF SVM — slow but often best on moderate-dim tabular
@@ -325,8 +442,25 @@ def main() -> None:
                         default="full_trait_output/pez_activations/responses.jsonl")
     parser.add_argument("--pez_activations_path",
                         default="full_trait_output/pez_activations/activations.pt")
-    parser.add_argument("--output_dir",   default="full_trait_output/all_traits_sweep_v2")
+    parser.add_argument("--wjb_classified_path",
+                        default="full_trait_output/wildjailbreak_activations/classified_responses.jsonl")
+    parser.add_argument("--wjb_activations_path",
+                        default="full_trait_output/wildjailbreak_activations/activations.pt")
+    parser.add_argument("--augment_classified_path", default=None,
+                        help="If set, fold these labelled rows into the TRAINING pool each seed "
+                             "(held-out eval families unchanged). Used for WJB training-augmentation.")
+    parser.add_argument("--augment_activations_path", default=None)
+    parser.add_argument("--output_dir",        default="full_trait_output/all_traits_sweep_v2")
+    parser.add_argument("--trait_vectors_dir", default=None,
+                        help="If set, build trait matrix from .pt files in this dir "
+                             "(for OLMo-3 or other non-default models). "
+                             "Cached in --output_dir between runs.")
     parser.add_argument("--layer",        type=int,   default=LAYER)
+    parser.add_argument("--trait_row_index", type=int, default=None,
+                        help="Row to select from each trait .pt 'vector' tensor. "
+                             "Defaults to --layer. Set when trait vectors aren't indexed "
+                             "by absolute layer (e.g. Gemma layer30_only: --layer 30 "
+                             "--trait_row_index 0).")
     parser.add_argument("--n_seeds",      type=int,   default=N_SEEDS)
     parser.add_argument("--train_frac",   type=float, default=TRAIN_FRAC)
     parser.add_argument("--val_frac",     type=float, default=VAL_FRAC)
@@ -334,6 +468,12 @@ def main() -> None:
                         help="Include RBF SVM (much slower).")
     parser.add_argument("--only_models",  default="",
                         help="Comma-separated subset of model names to run.")
+    parser.add_argument("--feature_type", choices=["trait", "raw", "pca", "random"], default="trait",
+                        help="Feature space: trait-projected, raw 4096-dim, PCA-reduced, or random projection.")
+    parser.add_argument("--pca_n_components", type=int, default=256,
+                        help="PCA output dimensionality (only used when --feature_type pca).")
+    parser.add_argument("--random_n_components", type=int, default=228,
+                        help="Random projection dimensionality (only used when --feature_type random).")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -353,6 +493,7 @@ def main() -> None:
         ("PAP",     args.pap_classified_path,      args.pap_activations_path),
         ("GPTFuzz", args.gptfuzz_classified_path,  args.gptfuzz_activations_path),
         ("PEZ",     args.pez_classified_path,      args.pez_activations_path),
+        ("WJB",     args.wjb_classified_path,      args.wjb_activations_path),
     ]
     transfer_data: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for name, rp, ap in transfer_inputs:
@@ -364,19 +505,91 @@ def main() -> None:
                 print(f"  {name}: {len(x_raw)} rows, jb={y_.mean():.3f}", flush=True)
                 transfer_data[name] = (x_raw, y_)
 
-    trait_matrix, trait_names = load_trait_matrix(args.layer)
-    print(f"  Trait matrix: {trait_matrix.shape}", flush=True)
+    aug_raw_x, aug_raw_y = None, None
+    if args.augment_classified_path and args.augment_activations_path:
+        # Comma-separated lists let us fold in multiple sources (e.g. WJB + GPTFuzz);
+        # each is loaded independently so colliding pair_ids across files don't clash.
+        cls_paths = [p.strip() for p in args.augment_classified_path.split(",") if p.strip()]
+        act_paths = [p.strip() for p in args.augment_activations_path.split(",") if p.strip()]
+        aug_xs, aug_ys = [], []
+        for cp, ap in zip(cls_paths, act_paths):
+            if not (Path(cp).exists() and Path(ap).exists()):
+                continue
+            ax, ay, _ = build_activation_matrix(load_jsonl(Path(cp)), load_activations(Path(ap)), args.layer)
+            if len(ax) > 0:
+                print(f"  AUGMENT(train) {Path(cp).parent.name}: {len(ax)} rows, jb={ay.mean():.3f}", flush=True)
+                aug_xs.append(ax); aug_ys.append(ay)
+        if aug_xs:
+            aug_raw_x = np.vstack(aug_xs)
+            aug_raw_y = np.concatenate(aug_ys)
+            print(f"  AUGMENT(train) TOTAL: {len(aug_raw_x)} rows, jb={aug_raw_y.mean():.3f}", flush=True)
+
+    if args.feature_type == "trait":
+        vectors_dir = Path(args.trait_vectors_dir) if args.trait_vectors_dir else None
+        trait_matrix, trait_names = load_trait_matrix(
+            args.layer,
+            vectors_dir=vectors_dir,
+            cache_dir=out_dir if vectors_dir is not None else None,
+            row_index=args.trait_row_index,
+        )
+        print(f"  Trait matrix: {trait_matrix.shape}", flush=True)
+    else:
+        trait_matrix, trait_names = None, []
+        print(f"  Feature type: {args.feature_type} (no trait matrix needed)", flush=True)
 
     # ── Build features ─────────────────────────────────────────────────────────
     print("\n=== Building features ===", flush=True)
     x_raw_h, y_h, human_valid = build_activation_matrix(human_rows, human_acts, args.layer)
-    x_h = project_all_traits(x_raw_h, trait_matrix)
-    print(f"  HarmBench: {x_h.shape}, jb={y_h.mean():.3f}", flush=True)
 
-    transfer: dict[str, tuple[np.ndarray, np.ndarray]] = {
-        name: (project_all_traits(xr, trait_matrix), y)
-        for name, (xr, y) in transfer_data.items()
-    }
+    if args.feature_type == "trait":
+        x_h = project_all_traits(x_raw_h, trait_matrix)
+        transfer: dict[str, tuple[np.ndarray, np.ndarray]] = {
+            name: (project_all_traits(xr, trait_matrix), y)
+            for name, (xr, y) in transfer_data.items()
+        }
+    elif args.feature_type == "raw":
+        x_h = x_raw_h
+        transfer = {name: (xr, y) for name, (xr, y) in transfer_data.items()}
+    elif args.feature_type == "pca":
+        n_components = min(args.pca_n_components, x_raw_h.shape[0] - 1, x_raw_h.shape[1])
+        pca = PCA(n_components=n_components, random_state=RANDOM_SEED)
+        x_h = pca.fit_transform(x_raw_h).astype(np.float32)
+        transfer = {
+            name: (pca.transform(xr).astype(np.float32), y)
+            for name, (xr, y) in transfer_data.items()
+        }
+        print(f"  PCA explained variance: {pca.explained_variance_ratio_.sum():.3f}", flush=True)
+    else:  # random
+        n_components = min(args.random_n_components, x_raw_h.shape[1])
+        rng = np.random.default_rng(RANDOM_SEED)
+        R = rng.standard_normal((x_raw_h.shape[1], n_components)).astype(np.float32)
+        R, _ = np.linalg.qr(R)  # orthonormal columns
+        R = R[:, :n_components].astype(np.float32)
+        x_h = (x_raw_h @ R).astype(np.float32)
+        transfer = {
+            name: ((xr @ R).astype(np.float32), y)
+            for name, (xr, y) in transfer_data.items()
+        }
+        print(f"  Random projection: {x_raw_h.shape[1]} → {n_components} dims (fixed seed, orthonormal)", flush=True)
+
+    x_aug = y_aug = None
+    if aug_raw_x is not None and len(aug_raw_x) > 0:
+        if args.feature_type == "trait":
+            x_aug = project_all_traits(aug_raw_x, trait_matrix)
+        elif args.feature_type == "raw":
+            x_aug = aug_raw_x
+        elif args.feature_type == "pca":
+            # fold augment into training in the SAME (HB-fit) PCA basis used for transfer
+            x_aug = pca.transform(aug_raw_x).astype(np.float32)
+        elif args.feature_type == "random":
+            x_aug = (aug_raw_x @ R).astype(np.float32)
+        else:
+            raise NotImplementedError(f"--augment_* not supported for feature_type {args.feature_type}")
+        y_aug = aug_raw_y
+        print(f"  Train pool augmented with {len(x_aug)} rows "
+              f"({int(y_aug.sum())} pos / {int((1 - y_aug).sum())} neg)", flush=True)
+
+    print(f"  HarmBench: {x_h.shape}, jb={y_h.mean():.3f}", flush=True)
 
     # ── Model specs ────────────────────────────────────────────────────────────
     specs = build_specs(args.include_slow)
@@ -416,11 +629,21 @@ def main() -> None:
             random_state=seed, stratify=y_h[train_idx],
         )
 
+        # Optional training-pool augmentation (val/test/transfer eval stay pure HarmBench).
+        if x_aug is not None:
+            x_tr_fit   = np.vstack([x_h[tr_idx], x_aug])
+            y_tr_fit   = np.concatenate([y_h[tr_idx], y_aug])
+            x_full_fit = np.vstack([x_h[train_idx], x_aug])
+            y_full_fit = np.concatenate([y_h[train_idx], y_aug])
+        else:
+            x_tr_fit,   y_tr_fit   = x_h[tr_idx],    y_h[tr_idx]
+            x_full_fit, y_full_fit = x_h[train_idx], y_h[train_idx]
+
         # --- Step 1: select best model by inner-val AUC ---
         val_aucs: dict[str, float] = {}
         for spec in specs:
             m = spec.builder(seed)
-            m.fit(x_h[tr_idx], y_h[tr_idx])
+            m.fit(x_tr_fit, y_tr_fit)
             val_score = get_score(m, x_h[val_idx])
             val_aucs[spec.name] = safe_auc(y_h[val_idx], val_score)
 
@@ -433,7 +656,7 @@ def main() -> None:
             raw[spec.name]["val_auc"].append(val_aucs[spec.name])
 
             m_full = spec.builder(seed)
-            m_full.fit(x_h[train_idx], y_h[train_idx])
+            m_full.fit(x_full_fit, y_full_fit)
 
             # Threshold from refit model's val predictions — not stale
             val_score_full = get_score(m_full, x_h[val_idx])
@@ -484,7 +707,7 @@ def main() -> None:
     ranked = sorted([s.name for s in specs], key=avg_transfer_auc, reverse=True)
 
     print("\n" + "=" * (len(header) + 2))
-    print(f"  ALL-TRAITS SWEEP v2 | layer {args.layer} | {args.n_seeds} seeds | PRIMARY METRIC: AUC")
+    print(f"  ALL-TRAITS SWEEP v2 | layer {args.layer} | {args.n_seeds} seeds | feature={args.feature_type} | PRIMARY METRIC: AUC")
     print("=" * (len(header) + 2))
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -530,6 +753,7 @@ def main() -> None:
     # ── Save ───────────────────────────────────────────────────────────────────
     out = {
         "method": "all_traits_sweep_v2",
+        "feature_type": args.feature_type,
         "layer":  args.layer,
         "n_seeds": args.n_seeds,
         "n_traits": len(trait_names),

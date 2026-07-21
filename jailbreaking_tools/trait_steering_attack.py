@@ -423,9 +423,6 @@ def attack_prompt(
         if is_jailbroken:
             logger.info(f"  ✓ Jailbreak succeeded at iteration {iteration+1} alpha={alpha}")
             break
-        if score >= SCORE_THRESHOLD:
-            logger.info(f"  Score {score:.4f} >= threshold — stopping")
-            break
         if iteration == MAX_ITER - 1:
             logger.info(f"  Max iterations reached")
 

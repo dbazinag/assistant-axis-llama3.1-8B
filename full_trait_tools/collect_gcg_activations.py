@@ -63,7 +63,7 @@ def load_behaviors(csv_path: Path) -> Dict[str, dict]:
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row.get("FunctionalCategory", "").lower() == "standard":
+            if True:  # accept all functional categories
                 behaviors[row["BehaviorID"]] = row
     logger.info(f"Loaded {len(behaviors)} standard behaviors")
     return behaviors

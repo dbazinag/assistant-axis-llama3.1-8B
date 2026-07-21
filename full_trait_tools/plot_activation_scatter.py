@@ -25,8 +25,9 @@ from typing import Dict, List
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import matplotlib.patheffects as pe
 from matplotlib.lines import Line2D
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 import torch
 from sklearn.decomposition import PCA
@@ -45,20 +46,30 @@ TRAITS_TO_SHOW = [
 ]
 AXIS_NAME = "assistant_axis"
 
-# Colors
-COLOR_JAILBROKEN = "#e63946"   # red
-COLOR_REFUSED    = "#457b9d"   # blue
-COLOR_DEGENERATE = "#adb5bd"   # grey
+# ── Palette (Assistant-Axis-paper inspired) ────────────────────────────────────
+FIG_BG    = "#F1EDE3"   # warm cream page
+PANEL_BG  = "#FBFAF6"   # panel card
+C_REFUSED = "#7F9EC0"   # soft blue  (assistant-like)
+C_JAILBRK = "#CE8A8A"   # soft rose  (role-playing / jailbroken)
+C_DEGEN   = "#BFBAB0"   # muted grey
+AXIS_BLUE = "#37618E"   # the assistant axis
+ARROW_RED = "#B15E6C"   # persona-direction arrows
+TEXT_DARK = "#3D3B37"
+TEXT_MUT  = "#6E6A62"
+GRID      = "#E4DFD4"
+SPINE     = "#D8D3C7"
+BOUNDARY  = "#8A857A"
 
-# Arrow colors per trait
-TRAIT_COLORS = {
-    "naive":         "#f4a261",
-    "essentialist":  "#e76f51",
-    "utilitarian":   "#2a9d8f",
-    "absolutist":    "#e9c46a",
-    "progressive":   "#264653",
-    "assistant_axis": "#6a0dad",
-}
+# soft blue -> cream -> rose band aligned with the classifier normal
+GRAD_CMAP = LinearSegmentedColormap.from_list(
+    "assist_grad", ["#AAC1D9", "#F5F2EA", "#E4B4B4"])
+
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["DejaVu Sans"],
+    "figure.facecolor": FIG_BG,
+    "savefig.facecolor": FIG_BG,
+})
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -94,6 +105,15 @@ def load_hyperplane(path: Path) -> np.ndarray:
 
 # ── Plot one scatter panel ─────────────────────────────────────────────────────
 
+def _panel_limits(X_2d: np.ndarray):
+    """Robust limits from the 1st/99th percentile so outliers don't shrink the
+    cluster; keeps the bulk of the data big and visible."""
+    lo = np.percentile(X_2d, 1, axis=0)
+    hi = np.percentile(X_2d, 99, axis=0)
+    pad = 0.12 * (hi - lo)
+    return (lo[0] - pad[0], hi[0] + pad[0]), (lo[1] - pad[1], hi[1] + pad[1])
+
+
 def plot_panel(
     ax,
     X_2d: np.ndarray,
@@ -104,72 +124,121 @@ def plot_panel(
     pca_var: List[float],
 ) -> None:
 
-    # Scatter
-    mask_jb  = labels == 1
-    mask_ref = labels == 0
-    mask_deg = labels == 2
+    ax.set_facecolor(PANEL_BG)
+    xlim, ylim = _panel_limits(X_2d)
 
-    ax.scatter(X_2d[mask_ref, 0], X_2d[mask_ref, 1],
-               c=COLOR_REFUSED, alpha=0.35, s=8, linewidths=0, label="Refused")
-    ax.scatter(X_2d[mask_jb, 0],  X_2d[mask_jb, 1],
-               c=COLOR_JAILBROKEN, alpha=0.35, s=8, linewidths=0, label="Jailbroken")
-    if mask_deg.any():
-        ax.scatter(X_2d[mask_deg, 0], X_2d[mask_deg, 1],
-                   c=COLOR_DEGENERATE, alpha=0.2, s=6, linewidths=0, label="Degenerate")
+    # 1. soft assistant/role-play gradient aligned with the classifier normal
+    wn = w_2d / (np.linalg.norm(w_2d) + 1e-12)
+    gx = np.linspace(*xlim, 240)
+    gy = np.linspace(*ylim, 240)
+    XX, YY = np.meshgrid(gx, gy)
+    proj = XX * wn[0] + YY * wn[1]
+    mx = np.abs(proj).max() + 1e-9
+    ax.imshow(proj, extent=[*xlim, *ylim], origin="lower", aspect="auto",
+              cmap=GRAD_CMAP, vmin=-mx, vmax=mx, alpha=0.16,
+              interpolation="bilinear", zorder=0)
 
-    # Classifier boundary line (w projected to 2D)
-    # The boundary is w·x = 0, so in 2D: w[0]*x + w[1]*y = 0 → y = -(w[0]/w[1])*x
-    xlims = ax.get_xlim()
+    # 2. grid + frame
+    ax.set_axisbelow(True)
+    ax.grid(True, color=GRID, linewidth=0.8, zorder=1)
+    for s in ax.spines.values():
+        s.set_color(SPINE)
+        s.set_linewidth(0.9)
+    ax.tick_params(colors=TEXT_MUT, labelsize=9, length=0)
+
+    # 3. scatter
+    m_ref = labels == 0
+    m_jb  = labels == 1
+    m_deg = labels == 2
+    if m_deg.any():
+        ax.scatter(X_2d[m_deg, 0], X_2d[m_deg, 1], c=C_DEGEN, s=14,
+                   alpha=0.35, linewidths=0, zorder=2)
+    ax.scatter(X_2d[m_ref, 0], X_2d[m_ref, 1], c=C_REFUSED, s=26, alpha=0.6,
+               edgecolors="white", linewidths=0.3, zorder=3)
+    ax.scatter(X_2d[m_jb, 0], X_2d[m_jb, 1], c=C_JAILBRK, s=26, alpha=0.6,
+               edgecolors="white", linewidths=0.3, zorder=3)
+
+    # 4. classifier boundary (w·x = 0  ->  y = -(w0/w1) x)
     if abs(w_2d[1]) > 1e-6:
-        x_range = np.linspace(X_2d[:, 0].min() * 1.2, X_2d[:, 0].max() * 1.2, 100)
-        y_range = -(w_2d[0] / w_2d[1]) * x_range
-        # Only draw within plot bounds
-        ax.plot(x_range, y_range, "k--", linewidth=1.0, alpha=0.5, label="Classifier boundary (w)")
+        xr = np.array(xlim)
+        ax.plot(xr, -(w_2d[0] / w_2d[1]) * xr, ls=(0, (6, 4)),
+                color=BOUNDARY, lw=1.4, alpha=0.75, zorder=4)
 
-    # Scale arrows to ~20% of axis range
-    x_range_size = X_2d[:, 0].max() - X_2d[:, 0].min()
-    y_range_size = X_2d[:, 1].max() - X_2d[:, 1].min()
-    scale = 0.22 * max(x_range_size, y_range_size)
+    span = max(xlim[1] - xlim[0], ylim[1] - ylim[0])
 
-    for name, vec_2d in trait_arrows.items():
-        norm = np.linalg.norm(vec_2d) + 1e-12
-        direction = vec_2d / norm
-        color = TRAIT_COLORS.get(name, "#333333")
-        ax.annotate(
-            "", xy=(direction[0] * scale, direction[1] * scale),
-            xytext=(0, 0),
-            arrowprops=dict(
-                arrowstyle="-|>",
-                color=color,
-                lw=2.0,
-            ),
-        )
-        # Label at arrow tip with slight offset
-        ax.text(
-            direction[0] * scale * 1.12,
-            direction[1] * scale * 1.12,
-            name,
-            fontsize=7.5,
-            color=color,
-            ha="center", va="center",
-            fontweight="bold",
-        )
+    cx = 0.5 * (xlim[0] + xlim[1])
+    cy = 0.5 * (ylim[0] + ylim[1])
 
-    ax.set_xlabel(f"PC1 ({100*pca_var[0]:.1f}% var)", fontsize=10)
-    ax.set_ylabel(f"PC2 ({100*pca_var[1]:.1f}% var)", fontsize=10)
-    ax.set_title(title, fontsize=11, fontweight="bold")
-    ax.axhline(0, color="grey", linewidth=0.4, alpha=0.4)
-    ax.axvline(0, color="grey", linewidth=0.4, alpha=0.4)
-    ax.set_xlim(X_2d[:, 0].min() * 1.25, X_2d[:, 0].max() * 1.25)
-    ax.set_ylim(X_2d[:, 1].min() * 1.25, X_2d[:, 1].max() * 1.25)
+    def draw_arrow(vec, length, color):
+        d = vec / (np.linalg.norm(vec) + 1e-12)
+        tip = d * length
+        ax.annotate("", xy=(tip[0], tip[1]), xytext=(0, 0), zorder=6,
+                    arrowprops=dict(arrowstyle="-|>", color=color,
+                                    lw=2.4, mutation_scale=18,
+                                    shrinkA=0, shrinkB=0))
+        return d, tip
 
-    # Legend
-    legend_elements = [
-        mpatches.Patch(color=COLOR_JAILBROKEN, alpha=0.7, label=f"Jailbroken (n={mask_jb.sum()})"),
-        mpatches.Patch(color=COLOR_REFUSED,    alpha=0.7, label=f"Refused (n={mask_ref.sum()})"),
-        Line2D([0], [0], color="k", linestyle="--", linewidth=1, label="Classifier boundary"),
+    def label_ha(lx, text, dx):
+        # extend outward from the origin, but flip inward near a panel edge
+        tw = 0.011 * span * len(text)
+        if dx >= 0:
+            return "right" if lx + tw > xlim[1] else "left"
+        return "left" if lx - tw < xlim[0] else "right"
+
+    def draw_label(lx, ly, text, color, fontsize, ha, va):
+        t = ax.text(lx, ly, text, color=color, fontsize=fontsize,
+                    fontweight="bold", ha=ha, va=va, zorder=8, clip_on=True)
+        t.set_path_effects([pe.withStroke(linewidth=3, foreground="white")])
+
+    # 5. persona direction arrows (rose), lightly staggered. Labels hug each
+    #    arrowhead, then get spread apart vertically so none overlap.
+    persona = [(n, v) for n, v in trait_arrows.items() if n != AXIS_NAME]
+    n_p = len(persona)
+    plabels = []
+    for i, (name, vec_2d) in enumerate(persona):
+        L = (0.42 - 0.02 * i) * span if n_p > 1 else 0.36 * span
+        d, tip = draw_arrow(vec_2d, L, ARROW_RED)
+        lx = tip[0] + d[0] * 0.03 * span
+        ly = tip[1] + d[1] * 0.03 * span
+        plabels.append({"x": lx, "y": ly, "name": name,
+                        "ha": label_ha(lx, name, d[0])})
+    gap = 0.05 * span
+    order = sorted(range(n_p), key=lambda k: -plabels[k]["y"])  # top first
+    for j in range(1, n_p):
+        a, b = order[j - 1], order[j]
+        if plabels[b]["y"] > plabels[a]["y"] - gap:
+            plabels[b]["y"] = plabels[a]["y"] - gap
+    for pl in plabels:
+        draw_label(pl["x"], pl["y"], pl["name"], ARROW_RED, 9.5, pl["ha"],
+                   "center")
+
+    # 6. assistant axis: same arrow style as the others, distinct blue.
+    if AXIS_NAME in trait_arrows:
+        d, tip = draw_arrow(trait_arrows[AXIS_NAME], 0.46 * span, AXIS_BLUE)
+        lx, ly = tip[0] + d[0] * 0.03 * span, tip[1] + d[1] * 0.03 * span
+        draw_label(lx, ly, AXIS_NAME, AXIS_BLUE, 10,
+                   label_ha(lx, AXIS_NAME, d[0]),
+                   "top" if d[1] < 0 else "bottom")
+
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_xlabel(f"PC1  ({100*pca_var[0]:.1f}% variance)", fontsize=10,
+                  color=TEXT_MUT)
+    ax.set_ylabel(f"PC2  ({100*pca_var[1]:.1f}% variance)", fontsize=10,
+                  color=TEXT_MUT)
+    ax.set_title(title, fontsize=13, fontweight="bold", color=TEXT_DARK, pad=10)
+
+    handles = [
+        Line2D([0], [0], marker="o", ls="", ms=8, mec="white", mew=0.4,
+               color=C_JAILBRK, label=f"Jailbroken (n={m_jb.sum()})"),
+        Line2D([0], [0], marker="o", ls="", ms=8, mec="white", mew=0.4,
+               color=C_REFUSED, label=f"Refused (n={m_ref.sum()})"),
+        Line2D([0], [0], color=BOUNDARY, ls=(0, (6, 4)), lw=1.4,
+               label="Classifier boundary"),
     ]
-    ax.legend(handles=legend_elements, fontsize=8, loc="upper right")
+    leg = ax.legend(handles=handles, fontsize=9, loc="upper right",
+                    framealpha=0.9, edgecolor=SPINE)
+    leg.get_frame().set_facecolor("white")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -189,6 +258,8 @@ def main():
     parser.add_argument("--output_path", type=str,
         default="full_trait_output/plots/activation_scatter_layer16.png")
     parser.add_argument("--layer", type=int, default=LAYER)
+    parser.add_argument("--single", action="store_true",
+        help="Render only the Jailbreak-PCA panel (single-panel paper figure).")
     args = parser.parse_args()
 
     output_path = Path(args.output_path)
@@ -289,29 +360,41 @@ def main():
 
     # ── Plot ───────────────────────────────────────────────────────────────────
     print("Plotting...")
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    if args.single:
+        fig, ax = plt.subplots(figsize=(8.4, 7.2), dpi=200)
+        plot_panel(
+            ax, X_jb_2d, labels,
+            trait_arrows_jb, w_jb_2d,
+            title=f"Pre-generation activation space  ·  Layer {args.layer}",
+            pca_var=pca_jb.explained_variance_ratio_[:2],
+        )
+        fig.tight_layout()
+        plt.savefig(output_path, dpi=200, bbox_inches="tight")
+        print(f"\nSaved to {output_path}")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.8), dpi=200)
     fig.suptitle(
-        f"Pre-generation Activation Space — Layer {args.layer}\n"
-        f"Human jailbreak pairs (n={len(X_list)}), colored by jailbreak outcome",
-        fontsize=12, fontweight="bold", y=1.01
+        f"Pre-generation activation space  ·  Layer {args.layer}",
+        fontsize=15, fontweight="bold", color=TEXT_DARK, y=1.02,
     )
 
     plot_panel(
         axes[0], X_jb_2d, labels,
         trait_arrows_jb, w_jb_2d,
-        title="Jailbreak PCA\n(PCA fit on jailbreak activations)",
+        title="Jailbreak PCA",
         pca_var=pca_jb.explained_variance_ratio_[:2],
     )
 
     plot_panel(
         axes[1], X_fresh_2d, labels,
         trait_arrows_fresh, w_fresh_2d,
-        title="Fresh PCA\n(PCA fit fresh for visualization)",
+        title="Fresh PCA",
         pca_var=pca_fresh.explained_variance_ratio_,
     )
 
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
     print(f"\nSaved to {output_path}")
 
 

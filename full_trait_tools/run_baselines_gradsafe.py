@@ -79,6 +79,69 @@ DATASETS = {
     },
 }
 
+MODEL_NAME_OLMO3 = "allenai/OLMo-3-7B-Instruct"
+
+# OLMo-3 target responses; attack-family prompts rebuilt from the per-behavior
+# test-case files the OLMo attack collector used (exp subdir varies per family).
+DATASETS_OLMO3 = {
+    "HarmBench": {
+        "responses":   "full_trait_output/harmbench_activations_olmo3/classified_responses.jsonl",
+        "metadata":    "full_trait_output/harmbench_activations_olmo3/pairs_metadata.jsonl",
+        "test_cases":  None,
+        "attack_type": "human_jailbreak",
+    },
+    "PAIR":    {"responses": "full_trait_output/pair_activations_olmo3_hb/classified_responses.jsonl",    "exp": "olmo3_7b_harmbench"},
+    "PAP":     {"responses": "full_trait_output/pap_activations_olmo3_hb/classified_responses.jsonl",     "exp": "olmo3_7b_top5"},
+    "GPTFuzz": {"responses": "full_trait_output/gptfuzz_activations_olmo3_hb/classified_responses.jsonl", "exp": "olmo3_7b"},
+    "PEZ":     {"responses": "full_trait_output/pez_activations_olmo3_hb/classified_responses.jsonl",     "exp": "olmo3_7b"},
+}
+
+MODEL_NAME_GEMMA = ("/mnt/dlabscratch1/bazina/.cache/huggingface/hub/"
+                    "models--google--gemma-4-31B-it/snapshots/"
+                    "fb9ae262347c3945692f09a612f8bb189def854f")
+
+
+def _olmo3_to_gemma(cfg):
+    """Gemma reuses the OLMo3 test_cases/exp; only the full_trait_output data paths change."""
+    out = {}
+    for name, c in cfg.items():
+        c2 = dict(c)
+        for k, v in c2.items():
+            if isinstance(v, str) and "full_trait_output" in v:
+                c2[k] = v.replace("_olmo3", "_gemma")
+        out[name] = c2
+    return out
+
+
+DATASETS_GEMMA = _olmo3_to_gemma(DATASETS_OLMO3)
+
+
+def load_olmo3_test_cases(attack_upper, exp):
+    """Merge per-behavior test_cases.json files (OLMo attack-collector layout)."""
+    ind_dir = (Path(HARMBENCH_ROOT) / "results" / f"HarmBench_{attack_upper}" / exp
+               / "test_cases" / "test_cases_individual_behaviors")
+    if not ind_dir.exists():
+        raise FileNotFoundError(f"Not found: {ind_dir}")
+    merged = {}
+    for bdir in sorted(ind_dir.iterdir()):
+        if not bdir.is_dir():
+            continue
+        tc_file = bdir / "test_cases.json"
+        if not tc_file.exists():
+            continue
+        with tc_file.open() as f:
+            d = json.load(f)
+        for bid, prompts in d.items():
+            flat = []
+            for p in prompts:
+                if isinstance(p, list):
+                    flat.extend(p)
+                elif isinstance(p, str):
+                    flat.append(p)
+            if flat:
+                merged[bid] = merged.get(bid, []) + flat
+    return merged
+
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
@@ -127,8 +190,7 @@ def build_prompt_map_harmbench(metadata_path, responses_path, jailbreak_template
     return pm
 
 
-def build_prompt_map_generic(responses, test_cases_path):
-    tc = json.load(open(test_cases_path))
+def build_prompt_map_generic(responses, tc):
     pm = {}
     behavior_counts = {}
     for row in responses:
@@ -308,28 +370,56 @@ def main():
                         help="Row/column unsafe-safe cosine gap threshold for safety-critical slices")
     parser.add_argument("--device",     default="cuda")
     parser.add_argument("--test",       action="store_true")
+    parser.add_argument("--olmo3",      action="store_true",
+                        help="Use OLMo-3-7B-Instruct + OLMo response paths (GCG excluded; not yet collected)")
+    parser.add_argument("--gemma",      action="store_true",
+                        help="Use Gemma-4-31B-it + Gemma response paths (GCG excluded)")
     args = parser.parse_args()
+
+    if args.gemma:
+        if args.model == MODEL_NAME:
+            args.model = MODEL_NAME_GEMMA
+        if args.output_dir == "full_trait_output/baselines_all_attacks":
+            args.output_dir = "full_trait_output/baselines_all_attacks_gemma"
+    elif args.olmo3:
+        if args.model == MODEL_NAME:
+            args.model = MODEL_NAME_OLMO3
+        if args.output_dir == "full_trait_output/baselines_all_attacks":
+            args.output_dir = "full_trait_output/baselines_all_attacks_olmo3"
+    datasets = DATASETS_GEMMA if args.gemma else (DATASETS_OLMO3 if args.olmo3 else DATASETS)
+    remote = args.olmo3 or args.gemma
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     logger.info(f"Loading {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=remote, trust_remote_code=remote)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Gemma-4 (head_dim=512) needs sdpa + bf16; GradSafe gradients flow through chunked_sdpa.
+    # Backprop through 31B won't fit on one 80GB GPU (weights ~62GB leave no room for the
+    # gradient graph), so shard across GPUs with device_map="auto". Per-name grads are
+    # offloaded to CPU after each backward, so only weights + one prompt's graph stay on-GPU.
+    extra = {"attn_implementation": "sdpa"} if args.gemma else {}
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float16, device_map={"": device})
+        args.model, dtype=torch.bfloat16 if args.gemma else torch.float16,
+        device_map="auto" if args.gemma else {"": device}, trust_remote_code=remote, **extra)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(True)
     logger.info("Model loaded.")
 
+    # Gemma-4 needs chunked SDPA around every forward/backward; patch for the rest of the run.
+    if args.gemma:
+        from chunked_sdpa import chunked_sdpa_scope
+        chunked_sdpa_scope().__enter__()
+
     logger.info("Fetching jailbreak templates...")
     jailbreak_templates = fetch_jailbreaks()
 
     # ── Load HarmBench and build splits ───────────────────────────────────────
-    hb_cfg  = DATASETS["HarmBench"]
+    hb_cfg  = datasets["HarmBench"]
     hb_rows = load_jsonl(hb_cfg["responses"])
     hb_rows = [r for r in hb_rows if r.get("attack_type") == "human_jailbreak"]
     hb_pm   = build_prompt_map_harmbench(
@@ -484,6 +574,19 @@ def main():
     # ── Step 3: Score all datasets ─────────────────────────────────────────────
     logger.info(f"\n=== Step 3: Scoring all attack families ===")
 
+    # Preemption-safe checkpoint: each scored prompt (~85s on Gemma-31B) is appended
+    # to a JSONL and flushed immediately, so a killed/preempted job resumes without
+    # recomputing any prompt. Calibration (~1h, deterministic seed=0 split) reruns on
+    # each restart — cheap vs the ~100h scoring sweep — so it is not checkpointed.
+    scores_path = output_dir / "gradsafe_scores_checkpoint.jsonl"
+    prior: dict = {}  # {family: {pair_id: (score, y)}}
+    if scores_path.exists():
+        for rec in load_jsonl(scores_path):
+            prior.setdefault(rec["family"], {})[rec["pair_id"]] = (rec["score"], rec["y"])
+        logger.info(f"  Resuming: loaded {sum(len(v) for v in prior.values())} scored prompts "
+                    f"from {scores_path}")
+    scores_sink = open(scores_path, "a")
+
     def score_dataset(name, rows, prompt_map, filter_type=None):
         if filter_type:
             rows = [r for r in rows if r.get("attack_type") == filter_type]
@@ -493,14 +596,21 @@ def main():
         if args.test:
             rows = rows[:10]
 
+        done = prior.get(name, {})
         scores_list, y_list = [], []
         for i, row in enumerate(rows):
             if i % 50 == 0:
-                logger.info(f"  {name} {i}/{len(rows)}")
+                logger.info(f"  {name} {i}/{len(rows)} ({len(done)} cached)")
             jb = row.get("jailbroken")
             if jb is None:
                 continue
-            prompt = prompt_map.get(row["pair_id"], "")
+            pid = row["pair_id"]
+            if pid in done:  # already scored in a previous (possibly preempted) run
+                score, y_cached = done[pid]
+                scores_list.append(score)
+                y_list.append(y_cached)
+                continue
+            prompt = prompt_map.get(pid, "")
             if not prompt:
                 continue
             g = compute_gradient(model, tokenizer, prompt, device)
@@ -509,8 +619,12 @@ def main():
             score = cosine_similarity_score(g, reference_grad, critical_masks)
             if np.isnan(score):
                 continue
+            y_val = 1 if jb else 0
+            scores_sink.write(json.dumps(
+                {"family": name, "pair_id": pid, "score": float(score), "y": y_val}) + "\n")
+            scores_sink.flush()
             scores_list.append(score)
-            y_list.append(1 if jb else 0)
+            y_list.append(y_val)
 
         y   = np.array(y_list)
         auc = balanced_auc(scores_list, y)
@@ -518,17 +632,37 @@ def main():
         logger.info(f"  {name}: {len(y)} pairs, {y.sum():.0f} jb, AUC={auc:.4f}, AP={ap:.4f}")
         return auc, ap, len(y), int(y.sum())
 
+    def write_results(results):
+        with open(output_dir / "gradsafe_all_attacks.json", "w") as f:
+            json.dump({
+                "n_jb_calib": n_jb_grads,
+                "n_benign_calib": n_benign_grads,
+                "critical_gap_threshold": args.critical_gap_threshold,
+                "n_critical_params": len(critical_masks),
+                "n_critical_rows": n_critical_rows,
+                "n_critical_cols": n_critical_cols,
+                "results": results,
+            }, f, indent=2)
+
     results = {}
-    for name, cfg in DATASETS.items():
+    for name, cfg in datasets.items():
         if not Path(cfg["responses"]).exists():
             logger.warning(f"Skipping {name} — not found")
             continue
         logger.info(f"\n--- {name} ---")
         rows = load_jsonl(cfg["responses"])
-        pm   = hb_pm if name == "HarmBench" else build_prompt_map_generic(rows, cfg["test_cases"])
+        if name == "HarmBench":
+            pm = hb_pm
+        elif args.olmo3 or args.gemma:
+            pm = build_prompt_map_generic(rows, load_olmo3_test_cases(name, cfg["exp"]))
+        else:
+            pm = build_prompt_map_generic(rows, json.load(open(cfg["test_cases"])))
         ft   = "human_jailbreak" if name == "HarmBench" else None
         auc, ap, n, n_jb = score_dataset(name, rows, pm, ft)
         results[name] = {"n": n, "n_jb": n_jb, "auc": auc, "average_precision": ap}
+        write_results(results)  # checkpoint after each family so finished ones survive preemption
+
+    scores_sink.close()
 
     # ── Summary ────────────────────────────────────────────────────────────────
     sep = "=" * 70
@@ -547,16 +681,7 @@ def main():
               f"{r['auc']:>8.4f}  {r['average_precision']:>8.4f}")
     print(sep)
 
-    with open(output_dir / "gradsafe_all_attacks.json", "w") as f:
-        json.dump({
-            "n_jb_calib": n_jb_grads,
-            "n_benign_calib": n_benign_grads,
-            "critical_gap_threshold": args.critical_gap_threshold,
-            "n_critical_params": len(critical_masks),
-            "n_critical_rows": n_critical_rows,
-            "n_critical_cols": n_critical_cols,
-            "results": results,
-        }, f, indent=2)
+    write_results(results)
     logger.info(f"Saved to {output_dir}/gradsafe_all_attacks.json")
 
 

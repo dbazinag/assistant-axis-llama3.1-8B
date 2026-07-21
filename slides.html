@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --navy:#16243f; --red:#c0392b; --blue:#3b5b8c; --orange:#d98324;
+    --ink:#1f2937; --grey:#64748b;
+    --lblue:#e8f0fa; --lred:#fbe6e1; --lgrey:#eef1f5; --lorange:#fcefdc;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:'Inter','Segoe UI','Helvetica Neue',Arial,'DejaVu Sans',sans-serif;}
+  .slide{
+    width:1280px; height:720px; position:relative; background:#ffffff;
+    padding:56px 70px; overflow:hidden; color:var(--ink);
+    border-bottom:1px solid #eee;
+  }
+  /* faint corner accent */
+  .slide::before{
+    content:""; position:absolute; top:0; right:0; width:300px; height:300px;
+    background:radial-gradient(circle at top right, rgba(192,57,43,.06), transparent 70%);
+  }
+  .title{font-size:46px; font-weight:800; color:var(--navy); letter-spacing:-.5px;}
+  .rule{display:block; width:130px; height:6px; background:var(--red); border-radius:3px; margin-top:14px;}
+  .caption{
+    position:absolute; left:70px; right:70px; bottom:46px; text-align:center;
+    font-size:29px; font-weight:700; color:var(--red); letter-spacing:-.3px;
+  }
+  .caption.grey{color:var(--grey);}
+  .caption.navy{color:var(--navy);}
+
+  /* figure slides */
+  .figwrap{position:absolute; left:70px; right:70px; top:150px; bottom:120px;
+    display:flex; align-items:center; justify-content:center;}
+  .figwrap img{max-width:100%; max-height:100%; object-fit:contain;
+    filter:drop-shadow(0 10px 26px rgba(20,36,63,.14));}
+
+  /* cards + diagram */
+  .row{position:absolute; left:70px; right:70px; top:300px;
+    display:flex; align-items:center; justify-content:center; gap:8px;}
+  .card{background:#fff; border:2.5px solid var(--navy); border-radius:18px;
+    padding:24px 26px; box-shadow:0 8px 26px rgba(20,36,63,.10);
+    text-align:center; line-height:1.28;}
+  .card .h{font-weight:800; font-size:22px; letter-spacing:.3px; display:block; margin-bottom:6px;}
+  .card .s{font-size:17px; color:var(--grey); font-weight:500;}
+  .card.blue{border-color:var(--blue); background:var(--lblue);} .card.blue .h{color:var(--navy);}
+  .card.red{border-color:var(--red); background:var(--lred);} .card.red .h{color:#8a2418;}
+  .card.grey{border-color:var(--navy); background:var(--lgrey);} .card.grey .h{color:var(--navy);}
+  .tag{font-style:italic; font-size:18px; font-weight:600; margin-top:12px;}
+  .stack{display:flex; flex-direction:column; gap:10px;}
+  .chip{border:2px solid var(--red); background:var(--lred); color:#8a2418;
+    border-radius:12px; padding:11px 30px; font-weight:700; font-size:19px; text-align:center;
+    box-shadow:0 4px 14px rgba(192,57,43,.10);}
+  svg.arrow{flex:0 0 auto;}
+
+  /* trait columns */
+  .cols{position:absolute; left:70px; right:70px; top:170px; display:flex; gap:30px;}
+  .col{flex:1; text-align:center;}
+  .col .ch{font-weight:800; font-size:19px; padding-bottom:8px; margin-bottom:8px; border-bottom:3px solid;}
+  .col .t{font-size:17px; color:var(--ink); padding:6px 0; font-weight:500;}
+
+  /* overarching conclusion banner */
+  .concl{position:absolute; left:56px; right:56px; bottom:30px; text-align:center; line-height:1.55;}
+  .concl .l{font-size:20px; font-weight:600; color:var(--ink);}
+  .concl b.jb{color:var(--red);} .concl b.rf{color:var(--blue);}
+
+  /* title slide */
+  .hero{position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center; padding:0 90px;}
+  .hero .bar{width:100%; height:12px; background:var(--red); position:absolute; bottom:0; left:0;}
+  .hero h1{font-size:56px; font-weight:900; color:var(--navy); line-height:1.12; letter-spacing:-1px;}
+  .hero .auth{font-size:25px; color:var(--ink); margin-top:34px; font-weight:600;}
+  .hero .aff{font-size:18px; color:var(--grey); margin-top:8px; font-weight:500;}
+  .hero .chip2{margin-top:26px; font-size:19px; color:var(--red); font-weight:700; font-style:italic;
+    border:2px solid var(--red); border-radius:30px; padding:8px 22px; background:var(--lred);}
+
+  /* takeaway */
+  .take{position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center; padding:0 110px; gap:6px;}
+  .take .lead{font-size:30px; color:var(--ink); font-weight:500;}
+  .take .big{font-size:40px; font-weight:900; letter-spacing:-.6px; line-height:1.18;}
+  .take .b1{color:var(--blue);} .take .b2{color:var(--red);}
+  .take .sub{font-size:26px; color:var(--navy); font-style:italic; margin-top:22px; font-weight:600;}
+  .take .foot{position:absolute; bottom:54px; left:0; right:0; font-size:17px; color:var(--grey); font-weight:500;}
+
+  .sublede{position:absolute; left:70px; right:70px; top:150px; text-align:center;
+    font-size:25px; color:var(--ink); font-weight:600;}
+
+  /* side notes (e.g. methods not plotted) */
+  .notes{position:absolute; left:70px; top:200px; width:300px;}
+  .notes .nh{font-size:15px; font-weight:800; color:var(--navy); margin-bottom:18px;
+    text-transform:uppercase; letter-spacing:.8px;}
+  .notes ul{list-style:none;}
+  .notes li{font-size:16.5px; color:var(--ink); line-height:1.42; margin-bottom:20px;
+    padding-left:22px; position:relative;}
+  .notes li::before{content:"•"; color:var(--red); position:absolute; left:0; font-size:20px; top:-2px;}
+  .notes b{color:var(--navy);}
+</style>
+</head>
+<body>
+
+<!-- 1 TITLE -->
+<section class="slide" data-name="slide_01_title">
+  <div class="hero">
+    <div class="bar"></div>
+    <h1>Detecting <span style="color:var(--blue)">and</span> Inducing Jailbreaks<br>with Persona-Trait Directions</h1>
+    <div class="auth">Dominic Bazina-Grolinger</div>
+    <div class="aff">with Viktor Moskvoretskii · Robert West &nbsp;—&nbsp; EPFL DLab</div>
+    <div class="chip2">Llama-3.1-8B-Instruct · HarmBench</div>
+  </div>
+</section>
+
+<!-- 2 QUESTION -->
+<section class="slide" data-name="slide_02_question">
+  <div class="title">The question<span class="rule"></span></div>
+  <div class="sublede">Are trait directions tied to jailbreaking — and is the link causal?</div>
+  <div class="row" style="top:320px; gap:4px;">
+    <div style="text-align:center">
+      <div class="card blue"><span class="h">DETECT</span><span class="s">do trait scores<br>flag jailbreaks?</span></div>
+      <div class="tag" style="color:var(--blue)">correlation</div>
+    </div>
+    <svg class="arrow" width="86" height="26"><line x1="68" y1="13" x2="6" y2="13" stroke="#3b5b8c" stroke-width="4"/><polygon points="18,5 2,13 18,21" fill="#3b5b8c"/></svg>
+    <div class="card grey" style="padding:30px 30px"><span class="h" style="font-size:24px">Persona-trait<br>subspace</span><span class="s">~229 directions</span></div>
+    <svg class="arrow" width="86" height="26"><line x1="18" y1="13" x2="80" y2="13" stroke="#c0392b" stroke-width="4"/><polygon points="68,5 84,13 68,21" fill="#c0392b"/></svg>
+    <div style="text-align:center">
+      <div class="card red"><span class="h">INDUCE</span><span class="s">does steering<br>cause them?</span></div>
+      <div class="tag" style="color:var(--red)">causation</div>
+    </div>
+  </div>
+  <div class="caption">Same subspace, two sides — that pairing is what lets us argue causality.</div>
+</section>
+
+<!-- 3 SETUP -->
+<section class="slide" data-name="slide_03_setup">
+  <div class="title">One trait subspace, used two ways<span class="rule"></span></div>
+
+  <svg width="1280" height="720" style="position:absolute; left:0; top:0; pointer-events:none; z-index:1;">
+    <defs>
+      <marker id="ahNavy" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#16243f"/></marker>
+      <marker id="ahBlue" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#3b5b8c"/></marker>
+      <marker id="ahRed" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#c0392b"/></marker>
+    </defs>
+    <line x1="240" y1="386" x2="294" y2="382" stroke="#16243f" stroke-width="4" stroke-linecap="round" marker-end="url(#ahNavy)"/>
+    <line x1="508" y1="382" x2="562" y2="386" stroke="#16243f" stroke-width="4" stroke-linecap="round" marker-end="url(#ahNavy)"/>
+    <line x1="772" y1="378" x2="872" y2="314" stroke="#3b5b8c" stroke-width="4" stroke-linecap="round" marker-end="url(#ahBlue)"/>
+    <line x1="772" y1="398" x2="872" y2="470" stroke="#c0392b" stroke-width="4" stroke-linecap="round" marker-end="url(#ahRed)"/>
+  </svg>
+
+  <div class="card blue" style="position:absolute; left:64px; top:352px; width:176px; z-index:2;"><span class="h" style="font-size:19px; margin-bottom:0;">Prompt</span></div>
+  <div class="card grey" style="position:absolute; left:300px; top:322px; width:206px; border-radius:64px; z-index:2;"><span class="h" style="font-size:19px">Activations</span><span class="s">Llama-3.1-8B<br>layer 16</span></div>
+  <div class="card grey" style="position:absolute; left:566px; top:330px; width:204px; z-index:2;"><span class="h" style="font-size:19px">Trait scores</span><span class="s">project onto ~229<br>persona axes&nbsp;(Tx)</span></div>
+  <div class="card blue" style="position:absolute; left:876px; top:262px; width:300px; z-index:2;"><span class="h" style="font-size:19px">Detector</span><span class="s">logistic regression → flag</span></div>
+  <div class="card red" style="position:absolute; left:876px; top:430px; width:300px; z-index:2;"><span class="h" style="font-size:19px">Steering attack</span><span class="s">push along w → induce jailbreak</span></div>
+
+  <div class="caption">It starts from the prompt's activations — the same trait scores feed detection <em>and</em> attack.</div>
+</section>
+
+<!-- 4 DETECTION PROTOCOL -->
+<section class="slide" data-name="slide_04_detection_setup">
+  <div class="title">Detection: trained on one, tested on five<span class="rule"></span></div>
+  <div class="row" style="top:250px; gap:6px;">
+    <div class="card grey"><span class="h" style="font-size:20px">Trait scores</span><span class="s">project activations onto<br>~229 trait directions</span></div>
+    <svg class="arrow" width="78" height="26"><line x1="6" y1="13" x2="68" y2="13" stroke="#3b5b8c" stroke-width="4"/><polygon points="56,5 72,13 56,21" fill="#3b5b8c"/></svg>
+    <div class="card blue"><span class="h" style="font-size:20px">TRAIN + TUNE</span><span class="s">HarmBench only<br>(logistic regression)</span></div>
+    <svg class="arrow" width="78" height="26"><line x1="6" y1="13" x2="68" y2="13" stroke="#c0392b" stroke-width="4"/><polygon points="56,5 72,13 56,21" fill="#c0392b"/></svg>
+    <div style="text-align:center">
+      <div style="font-weight:800; color:var(--red); font-size:19px; margin-bottom:12px;">Transfer: 5 unseen families</div>
+      <div class="stack">
+        <div class="chip">GCG</div><div class="chip">PAIR</div><div class="chip">PAP</div>
+        <div class="chip">GPTFuzz</div><div class="chip">PEZ</div>
+      </div>
+    </div>
+  </div>
+  <div class="caption">Never trained on the attacks we evaluate → it measures transfer.</div>
+</section>
+
+<!-- 5 DETECTION RESULT -->
+<section class="slide" data-name="slide_05_detection_result">
+  <div class="title">Trait projections transfer best<span class="rule"></span></div>
+  <div class="figwrap"><img src="presentation_figures/fig_id_vs_transfer.png"></div>
+  <div class="caption">In-distribution winners overfit; trait features generalize (best transfer, 0.76).</div>
+</section>
+
+<!-- 6 TRAITS -->
+<section class="slide" data-name="slide_06_traits">
+  <div class="title">Which traits drive it — top 10<span class="rule"></span></div>
+  <div class="cols">
+    <div class="col">
+      <div class="ch" style="color:var(--blue); border-color:var(--blue)">toward REFUSAL</div>
+      <div class="t">paranoid</div><div class="t">confrontational</div><div class="t">gregarious</div><div class="t">analytical</div><div class="t">circumspect</div><div class="t">eclectic</div><div class="t">extroverted</div><div class="t">essentialist</div><div class="t">artistic</div><div class="t">pedantic</div>
+    </div>
+    <div class="col">
+      <div class="ch" style="color:var(--red); border-color:var(--red)">toward JAILBREAK</div>
+      <div class="t">regulatory</div><div class="t">risk-taking</div><div class="t">blunt</div><div class="t">impulsive</div><div class="t">ritualistic</div><div class="t">egalitarian</div><div class="t">perfectionist</div><div class="t">detached</div><div class="t">sassy</div><div class="t">adaptable</div>
+    </div>
+    <div class="col">
+      <div class="ch" style="color:var(--orange); border-color:var(--orange)">aligned with steering axis w</div>
+      <div class="t">sardonic</div><div class="t">wry</div><div class="t">impulsive</div><div class="t">sarcastic</div><div class="t">blunt</div><div class="t">acerbic</div><div class="t">abstract</div><div class="t">closure-seeking</div><div class="t">deontological</div><div class="t">egalitarian</div>
+    </div>
+  </div>
+  <div class="concl">
+    <div class="l">More <b class="jb">disinhibited</b> (impulsive · blunt · risk-taking · sarcastic · detached) → <b class="jb">more likely to jailbreak</b></div>
+    <div class="l">More <b class="rf">cautious &amp; guarded</b> (paranoid · analytical · circumspect · pedantic) → <b class="rf">more likely to refuse</b></div>
+  </div>
+</section>
+
+<!-- 7 EFFICIENCY -->
+<section class="slide" data-name="slide_07_efficiency">
+  <div class="title">…and detection is essentially free<span class="rule"></span></div>
+  <div class="figwrap"><img src="presentation_figures/fig_accuracy_vs_cost.png"></div>
+  <div class="caption">Best transfer <em>and</em> in the cheapest class — ~500× below Llama Guard.</div>
+</section>
+
+<!-- 8 ATTACK -->
+<section class="slide" data-name="slide_08_attack">
+  <div class="title">Steering induces jailbreaks<span class="rule"></span></div>
+  <div class="figwrap"><img src="presentation_figures/fig_attack_asr.png"></div>
+  <div class="caption">Flips ~75% of refusals; the dense direction transfers, top-k doesn't.</div>
+</section>
+
+<!-- 9 CAUSAL -->
+<section class="slide" data-name="slide_09_causal">
+  <div class="title">Why this is causal<span class="rule"></span></div>
+  <div class="figwrap"><img src="presentation_figures/fig_causal_dims.png"></div>
+  <div class="caption">Drop ~3,900 dimensions, lose ~1 point — the signal is in the trait subspace.</div>
+</section>
+
+<!-- 10 TAKEAWAY -->
+<section class="slide" data-name="slide_10_takeaway">
+  <div class="title">Takeaway<span class="rule"></span></div>
+  <div class="take">
+    <div class="lead">The same persona-trait subspace gives</div>
+    <div class="big b1">the best-transferring detector</div>
+    <div class="big b2">AND the strongest refusal-flipping attack.</div>
+    <div class="sub">→ traits are tied to jailbreaking, and the link is partly causal.</div>
+    <div class="foot">In progress: OLMo-3, Gemma &nbsp;·&nbsp; Caveats: single model · judge-based · PAP hard</div>
+  </div>
+</section>
+
+</body>
+</html>

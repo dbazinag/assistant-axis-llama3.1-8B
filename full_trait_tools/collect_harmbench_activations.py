@@ -178,8 +178,9 @@ def build_pairs(
 def load_model_and_tokenizer(
     model_name: str,
     device: torch.device,
+    trust_remote_code: bool = False,
 ) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -188,6 +189,7 @@ def load_model_and_tokenizer(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map={"": device},
+        trust_remote_code=trust_remote_code,
     )
     model.eval()
     return model, tokenizer
@@ -292,6 +294,7 @@ def worker_fn(
     model_name: str,
     max_new_tokens: int,
     output_dir: Path,
+    trust_remote_code: bool = False,
 ) -> None:
     """Runs in a subprocess. Processes a subset of pairs on one GPU."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -309,7 +312,7 @@ def worker_fn(
     wlogger = logging.getLogger(f"worker_{worker_id}")
     wlogger.info(f"Starting — {len(pairs)} pairs assigned")
 
-    model, tokenizer = load_model_and_tokenizer(model_name, device)
+    model, tokenizer = load_model_and_tokenizer(model_name, device, trust_remote_code)
 
     responses:    List[dict]              = []
     activations:  Dict[int, dict]         = {}   # pair_id -> {layer_idx_str: tensor}
@@ -440,6 +443,10 @@ def main() -> None:
             "single GPU, ~2 min"
         ),
     )
+    parser.add_argument(
+        "--trust_remote_code", action="store_true",
+        help="Pass trust_remote_code=True to AutoModel/AutoTokenizer (needed for OLMo-3)",
+    )
     args = parser.parse_args()
 
     # Redirect output dir for test runs
@@ -531,6 +538,7 @@ def main() -> None:
         model_name=args.model,
         max_new_tokens=args.max_new_tokens,
         output_dir=output_dir,
+        trust_remote_code=args.trust_remote_code,
     )
 
     if n_workers == 1:

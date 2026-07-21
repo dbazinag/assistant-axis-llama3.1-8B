@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import random
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List
 
@@ -32,7 +33,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from run_baselines_jbshield_fjd import (
     DATASETS,
+    DATASETS_GEMMA,
     MODEL_NAME,
+    MODEL_NAME_GEMMA,
     N_SEEDS,
     RANDOM_SEED,
     TRAIN_FRAC,
@@ -42,6 +45,7 @@ from run_baselines_jbshield_fjd import (
     filter_rows,
     get_pool_split,
     load_jsonl,
+    load_olmo3_test_cases,
     split_by_pool,
     test_subset,
 )
@@ -105,38 +109,44 @@ def load_rows_and_prompts(args):
     torch.manual_seed(RANDOM_SEED)
 
     jailbreak_templates = fetch_jailbreaks()
+    datasets = DATASETS_GEMMA if args.gemma else DATASETS
     rows_by_name = {}
     prompt_maps = {}
-    for name, cfg in DATASETS.items():
+    for name, cfg in datasets.items():
         rows_path = Path(cfg["responses"])
         if not rows_path.exists():
             logger.warning(f"Skipping {name}: missing {rows_path}")
             continue
-        rows = filter_rows(name, load_jsonl(rows_path))
+        rows = filter_rows(cfg, load_jsonl(rows_path))
         if args.test:
             rows = test_subset(rows, args.test_rows)
         rows_by_name[name] = rows
         if name == "HarmBench":
             prompt_maps[name] = build_prompt_map_harmbench(
                 cfg["metadata"], cfg["responses"], jailbreak_templates)
+        elif args.gemma:
+            prompt_maps[name] = build_prompt_map_generic(rows, load_olmo3_test_cases(name, cfg["exp"]))
         else:
-            prompt_maps[name] = build_prompt_map_generic(rows, cfg["test_cases"])
+            prompt_maps[name] = build_prompt_map_generic(rows, json.load(open(cfg["test_cases"])))
         logger.info(f"  {name}: {len(rows)} rows")
     if "HarmBench" not in rows_by_name:
         raise FileNotFoundError("HarmBench rows are required for train calibration.")
     return rows_by_name, prompt_maps
 
 
-def load_model(model_name: str, device_arg: str):
+def load_model(model_name: str, device_arg: str, gemma: bool = False):
     device = torch.device(device_arg if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=gemma, trust_remote_code=gemma)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    extra = {"attn_implementation": "sdpa", "trust_remote_code": True} if gemma else {}  # Gemma-4 head_dim=512
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        dtype=torch.bfloat16 if (gemma and device.type == "cuda")
+        else (torch.float16 if device.type == "cuda" else torch.float32),
         device_map={"": device},
+        **extra,
     )
     model.eval()
     return model, tokenizer, device
@@ -207,19 +217,24 @@ def score_fjd_paper(rows_by_name, prompt_maps, args):
     if cached is not None:
         return cached
 
-    model, tokenizer, device = load_model(args.model, args.device)
+    model, tokenizer, device = load_model(args.model, args.device, args.gemma)
+    scope_cm = nullcontext
+    if args.gemma:
+        from chunked_sdpa import chunked_sdpa_scope
+        scope_cm = chunked_sdpa_scope
     scores_by_name = {}
-    for name, rows in rows_by_name.items():
-        prompt_map = prompt_maps[name]
-        scores = []
-        logger.info(f"  FJD-paper scoring {name}: {len(rows)} rows")
-        for i, row in enumerate(rows):
-            if i % 100 == 0:
-                logger.info(f"    {name} {i}/{len(rows)}")
-            prompt = prompt_map.get(row["pair_id"], "")
-            scores.append(fjd_first_token_confidence(model, tokenizer, prompt, device, args))
-        scores_by_name[name] = np.array(scores, dtype=float)
-        save_scores(cache_path, scores_by_name)
+    with scope_cm():
+        for name, rows in rows_by_name.items():
+            prompt_map = prompt_maps[name]
+            scores = []
+            logger.info(f"  FJD-paper scoring {name}: {len(rows)} rows")
+            for i, row in enumerate(rows):
+                if i % 100 == 0:
+                    logger.info(f"    {name} {i}/{len(rows)}")
+                prompt = prompt_map.get(row["pair_id"], "")
+                scores.append(fjd_first_token_confidence(model, tokenizer, prompt, device, args))
+            scores_by_name[name] = np.array(scores, dtype=float)
+            save_scores(cache_path, scores_by_name)
 
     return scores_by_name
 
@@ -298,11 +313,18 @@ def parse_args():
     parser.add_argument("--recompute", action="store_true")
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--test_rows", type=int, default=200)
+    parser.add_argument("--gemma", action="store_true",
+                        help="Use Gemma-4-31B + Gemma responses/prompts (GCG excluded)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.gemma:
+        if args.model == MODEL_NAME:
+            args.model = MODEL_NAME_GEMMA
+        if args.output_dir == DEFAULT_OUTPUT_DIR:
+            args.output_dir = f"{DEFAULT_OUTPUT_DIR}_gemma"
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rows_by_name, prompt_maps = load_rows_and_prompts(args)

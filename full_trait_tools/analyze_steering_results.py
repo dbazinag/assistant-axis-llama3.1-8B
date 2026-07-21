@@ -96,6 +96,7 @@ def find_flip_example(
     cond_name: str,
     alpha: float,
     flip_type: str,  # "protective" or "induction"
+    example_idx: int = 0,
 ) -> Optional[dict]:
     """
     Find a pair where steering caused a label flip at the given alpha.
@@ -121,12 +122,16 @@ def find_flip_example(
     # Index baseline by pair_id
     baseline_by_pid = {e["pair_id"]: e for e in baseline_entries}
 
+    match_count = 0
     for steered in steered_entries:
         pid = steered["pair_id"]
         baseline = baseline_by_pid.get(pid)
         if baseline is None:
             continue
         if baseline["label"] == want_baseline and steered["label"] == want_steered:
+            if match_count < example_idx:
+                match_count += 1
+                continue
             return {
                 "pair_id":          pid,
                 "behavior":         steered["behavior"],
@@ -168,6 +173,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results_path", type=str,
         default="full_trait_output/steering_robustness_v2/steering_robustness_v2_results.json")
+    parser.add_argument("--flip_example_idx", type=int, default=0, help="Which flip example to show (0=first)")
     parser.add_argument("--flip_alpha", type=float, default=0.25,
         help="Alpha level to use for flip examples")
     args = parser.parse_args()
@@ -269,7 +275,7 @@ def main() -> None:
 
         # --- Protective flip: jailbroken → refused ---
         prot_example = find_flip_example(
-            protective, induction, prot_cond, flip_alpha, "protective"
+            protective, induction, prot_cond, flip_alpha, "protective", args.flip_example_idx
         )
         if prot_example:
             print_flip_example(
@@ -283,7 +289,7 @@ def main() -> None:
                 if alt_alpha == flip_alpha:
                     continue
                 ex = find_flip_example(
-                    protective, induction, prot_cond, alt_alpha, "protective"
+                    protective, induction, prot_cond, alt_alpha, "protective", args.flip_example_idx
                 )
                 if ex:
                     print(f"  Found at alpha={alt_alpha} instead:")
@@ -295,7 +301,7 @@ def main() -> None:
         # --- Induction flip: refused → jailbroken ---
         if induction and ind_cond in induction:
             ind_example = find_flip_example(
-                protective, induction, ind_cond, flip_alpha, "induction"
+                protective, induction, ind_cond, flip_alpha, "induction", args.flip_example_idx
             )
             if ind_example:
                 print_flip_example(
@@ -308,7 +314,7 @@ def main() -> None:
                     if alt_alpha == flip_alpha:
                         continue
                     ex = find_flip_example(
-                        protective, induction, ind_cond, alt_alpha, "induction"
+                        protective, induction, ind_cond, alt_alpha, "induction", args.flip_example_idx
                     )
                     if ex:
                         print(f"  Found at alpha={alt_alpha} instead:")

@@ -28,6 +28,7 @@ import json
 import logging
 import random
 import urllib.request
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -87,6 +88,73 @@ DATASETS = {
     },
 }
 
+MODEL_NAME_OLMO3 = "allenai/OLMo-3-7B-Instruct"
+
+# OLMo-3 target responses + activations; attack-family prompts rebuilt from the
+# per-behavior OLMo test-case files (exp subdir varies per family). GCG excluded
+# (not yet collected for OLMo).
+DATASETS_OLMO3 = {
+    "HarmBench": {
+        "responses":   "full_trait_output/harmbench_activations_olmo3/classified_responses.jsonl",
+        "metadata":    "full_trait_output/harmbench_activations_olmo3/pairs_metadata.jsonl",
+        "activations": "full_trait_output/harmbench_activations_olmo3/activations.pt",
+        "test_cases":  None,
+        "attack_type": "human_jailbreak",
+    },
+    "PAIR":    {"responses": "full_trait_output/pair_activations_olmo3_hb/classified_responses.jsonl",    "activations": "full_trait_output/pair_activations_olmo3_hb/activations.pt",    "exp": "olmo3_7b_harmbench"},
+    "PAP":     {"responses": "full_trait_output/pap_activations_olmo3_hb/classified_responses.jsonl",     "activations": "full_trait_output/pap_activations_olmo3_hb/activations.pt",     "exp": "olmo3_7b_top5"},
+    "GPTFuzz": {"responses": "full_trait_output/gptfuzz_activations_olmo3_hb/classified_responses.jsonl", "activations": "full_trait_output/gptfuzz_activations_olmo3_hb/activations.pt", "exp": "olmo3_7b"},
+    "PEZ":     {"responses": "full_trait_output/pez_activations_olmo3_hb/classified_responses.jsonl",     "activations": "full_trait_output/pez_activations_olmo3_hb/activations.pt",     "exp": "olmo3_7b"},
+}
+
+# Gemma-4-31B-it. Single layer 30 was collected (shape 5376), so JBShield uses --layer 30.
+MODEL_NAME_GEMMA = ("/mnt/dlabscratch1/bazina/.cache/huggingface/hub/"
+                    "models--google--gemma-4-31B-it/snapshots/"
+                    "fb9ae262347c3945692f09a612f8bb189def854f")
+GEMMA_LAYER = 30
+
+
+def _olmo3_to_gemma(cfg):
+    """Gemma reuses the OLMo3 test_cases/exp; only the full_trait_output data paths change."""
+    out = {}
+    for name, c in cfg.items():
+        c2 = dict(c)
+        for k, v in c2.items():
+            if isinstance(v, str) and "full_trait_output" in v:
+                c2[k] = v.replace("_olmo3", "_gemma")
+        out[name] = c2
+    return out
+
+
+DATASETS_GEMMA = _olmo3_to_gemma(DATASETS_OLMO3)
+
+
+def load_olmo3_test_cases(attack_upper, exp):
+    """Merge per-behavior test_cases.json files (OLMo attack-collector layout)."""
+    ind_dir = (Path(HARMBENCH_ROOT) / "results" / f"HarmBench_{attack_upper}" / exp
+               / "test_cases" / "test_cases_individual_behaviors")
+    if not ind_dir.exists():
+        raise FileNotFoundError(f"Not found: {ind_dir}")
+    merged = {}
+    for bdir in sorted(ind_dir.iterdir()):
+        if not bdir.is_dir():
+            continue
+        tc_file = bdir / "test_cases.json"
+        if not tc_file.exists():
+            continue
+        with tc_file.open() as f:
+            d = json.load(f)
+        for bid, prompts in d.items():
+            flat = []
+            for p in prompts:
+                if isinstance(p, list):
+                    flat.extend(p)
+                elif isinstance(p, str):
+                    flat.append(p)
+            if flat:
+                merged[bid] = merged.get(bid, []) + flat
+    return merged
+
 
 def load_jsonl(path: Path) -> List[dict]:
     rows = []
@@ -133,8 +201,7 @@ def build_prompt_map_harmbench(metadata_path, responses_path, jailbreak_template
     return pm
 
 
-def build_prompt_map_generic(rows, test_cases_path):
-    tc = json.load(open(test_cases_path))
+def build_prompt_map_generic(rows, tc):
     pm = {}
     behavior_counts = {}
     for row in rows:
@@ -156,8 +223,8 @@ def build_prompt_map_generic(rows, test_cases_path):
     return pm
 
 
-def filter_rows(name: str, rows: List[dict]) -> List[dict]:
-    filter_type = DATASETS[name].get("attack_type")
+def filter_rows(cfg: dict, rows: List[dict]) -> List[dict]:
+    filter_type = cfg.get("attack_type")
     if filter_type:
         rows = [r for r in rows if r.get("attack_type") == filter_type]
     return rows
@@ -275,7 +342,7 @@ class MeanDirectionDetector:
         return Xs @ self.w
 
 
-def run_jbshield(rows_by_name, acts_by_name, args):
+def run_jbshield(rows_by_name, acts_by_name, args, wjb_X=None, wjb_y=None):
     logger.info("\n=== JBShield-style mean direction ===")
     X_by_name, y_by_name = {}, {}
     human_valid = None
@@ -298,10 +365,14 @@ def run_jbshield(rows_by_name, acts_by_name, args):
 
         X_h = X_by_name["HarmBench"]
         y_h = y_by_name["HarmBench"]
-        det = MeanDirectionDetector().fit(X_h[train_idx], y_h[train_idx])
-        train_scores = det.score(X_h[train_idx])
-        train_scores, orient = orient_scores(train_scores, y_h[train_idx])
-        threshold, train_bacc = best_threshold(train_scores, y_h[train_idx])
+        X_tr, y_tr = X_h[train_idx], y_h[train_idx]
+        if wjb_X is not None:  # fold WJB into the calibration pool (HB+WJB)
+            X_tr = np.vstack([X_tr, wjb_X])
+            y_tr = np.concatenate([y_tr, wjb_y])
+        det = MeanDirectionDetector().fit(X_tr, y_tr)
+        train_scores = det.score(X_tr)
+        train_scores, orient = orient_scores(train_scores, y_tr)
+        threshold, train_bacc = best_threshold(train_scores, y_tr)
         train_baccs.append(train_bacc)
 
         for name in rows_by_name:
@@ -353,7 +424,15 @@ def compliance_logprob(model, tokenizer, prompt_text, device, max_length=2048):
         return float("nan")
 
 
-def score_prompts_fjd(rows_by_name, prompt_maps, args):
+def score_prompts_fjd(rows_by_name, prompt_maps, args, wjb_rows=None, wjb_prompt_map=None):
+    # WJB calibration prompts are scored alongside the eval families under a reserved
+    # "__WJB__" key, then split back out so they only feed the per-seed train pool.
+    score_targets = dict(rows_by_name)
+    pm_targets = dict(prompt_maps)
+    if wjb_rows is not None:
+        score_targets["__WJB__"] = wjb_rows
+        pm_targets["__WJB__"] = wjb_prompt_map
+
     cache_path = Path(args.output_dir) / "fjd_compliance_scores.json"
     if cache_path.exists() and not args.recompute_fjd:
         logger.info(f"Loading cached FJD scores: {cache_path}")
@@ -361,45 +440,62 @@ def score_prompts_fjd(rows_by_name, prompt_maps, args):
             cached = json.load(f)
         cache_ok = all(
             name in cached and len(cached[name].get("scores", [])) == len(rows)
-            for name, rows in rows_by_name.items()
+            for name, rows in score_targets.items()
         )
         if cache_ok:
-            return {name: np.array(cached[name]["scores"], dtype=float) for name in cached}
+            all_scores = {name: np.array(cached[name]["scores"], dtype=float) for name in cached}
+            wjb_scores = all_scores.pop("__WJB__", None)
+            return all_scores, wjb_scores
         logger.warning("Cached FJD scores do not match current dataset sizes; recomputing.")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    remote = bool(getattr(args, "olmo3", False) or getattr(args, "gemma", False))
     logger.info(f"Loading {args.model} for FJD-style compliance scores...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=remote, trust_remote_code=remote)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, device_map={"": device})
+    if getattr(args, "gemma", False):
+        # Gemma-4-31B needs sdpa + chunked attention; single-device bf16 (~62GB).
+        from chunked_sdpa import chunked_sdpa_scope
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=torch.bfloat16, attn_implementation="sdpa",
+            device_map="cuda:0", trust_remote_code=True)
+        scope_cm = chunked_sdpa_scope
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=torch.bfloat16, device_map={"": device}, trust_remote_code=remote)
+        scope_cm = nullcontext
     model.eval()
 
     scores_by_name = {}
     serializable = {}
-    for name, rows in rows_by_name.items():
-        prompt_map = prompt_maps[name]
-        scores = []
-        logger.info(f"  FJD scoring {name}: {len(rows)} rows")
-        for i, row in enumerate(rows):
-            if i % 100 == 0:
-                logger.info(f"    {name} {i}/{len(rows)}")
-            prompt = prompt_map.get(row["pair_id"], "")
-            scores.append(compliance_logprob(model, tokenizer, prompt, device) if prompt else float("nan"))
-        arr = np.array(scores, dtype=float)
-        scores_by_name[name] = arr
-        serializable[name] = {"scores": arr.tolist()}
+    with scope_cm():
+        for name, rows in score_targets.items():
+            prompt_map = pm_targets[name]
+            scores = []
+            logger.info(f"  FJD scoring {name}: {len(rows)} rows")
+            for i, row in enumerate(rows):
+                if i % 100 == 0:
+                    logger.info(f"    {name} {i}/{len(rows)}")
+                prompt = prompt_map.get(row["pair_id"], "")
+                scores.append(compliance_logprob(model, tokenizer, prompt, device) if prompt else float("nan"))
+            arr = np.array(scores, dtype=float)
+            scores_by_name[name] = arr
+            serializable[name] = {"scores": arr.tolist()}
 
     with open(cache_path, "w") as f:
         json.dump(serializable, f)
     logger.info(f"Saved FJD scores to {cache_path}")
-    return scores_by_name
+    wjb_scores = scores_by_name.pop("__WJB__", None)
+    return scores_by_name, wjb_scores
 
 
-def run_fjd(rows_by_name, prompt_maps, args):
+def run_fjd(rows_by_name, prompt_maps, args, wjb_rows=None, wjb_prompt_map=None):
     logger.info("\n=== FJD-style compliance likelihood ===")
-    scores_by_name = score_prompts_fjd(rows_by_name, prompt_maps, args)
+    scores_by_name, wjb_scores = score_prompts_fjd(rows_by_name, prompt_maps, args,
+                                                   wjb_rows=wjb_rows, wjb_prompt_map=wjb_prompt_map)
+    wjb_y = (np.array([1 if r.get("jailbroken") else 0 for r in wjb_rows], dtype=int)
+             if wjb_rows is not None else None)
     y_by_name = {
         name: np.array([1 if r.get("jailbroken") else 0 for r in rows], dtype=int)
         for name, rows in rows_by_name.items()
@@ -419,6 +515,10 @@ def run_fjd(rows_by_name, prompt_maps, args):
         ok = np.isfinite(s_train_raw)
         s_train = s_train_raw[ok]
         y_train = y_train[ok]
+        if wjb_scores is not None:  # fold WJB into the calibration pool (HB+WJB)
+            wok = np.isfinite(wjb_scores)
+            s_train = np.concatenate([s_train, wjb_scores[wok]])
+            y_train = np.concatenate([y_train, wjb_y[wok]])
         s_train, orient = orient_scores(s_train, y_train)
         threshold, train_bacc = best_threshold(s_train, y_train)
         train_baccs.append(train_bacc)
@@ -474,7 +574,31 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--recompute_fjd", action="store_true")
     parser.add_argument("--test", action="store_true")
+    parser.add_argument("--olmo3", action="store_true",
+                        help="Use OLMo-3-7B + OLMo activations/responses (GCG excluded; not yet collected)")
+    parser.add_argument("--gemma", action="store_true",
+                        help="Use Gemma-4-31B + Gemma activations/responses (GCG excluded; layer 30)")
+    parser.add_argument("--augment_wjb", action="store_true",
+                        help="Fold WildJailbreak into the per-seed calibration pool (HB+WJB) for "
+                             "JBShield (acts) and FJD (compliance score); eval families unchanged. "
+                             "Output dir gets a _hbwjb suffix. Gemma/layer-30 only.")
     args = parser.parse_args()
+
+    if args.gemma:
+        if args.model == MODEL_NAME:
+            args.model = MODEL_NAME_GEMMA
+        if args.output_dir == "full_trait_output/baselines_jbshield_fjd":
+            args.output_dir = "full_trait_output/baselines_jbshield_fjd_gemma"
+        if args.layer == LAYER:
+            args.layer = GEMMA_LAYER
+    if args.augment_wjb:
+        args.output_dir = args.output_dir + "_hbwjb"
+    elif args.olmo3:
+        if args.model == MODEL_NAME:
+            args.model = MODEL_NAME_OLMO3
+        if args.output_dir == "full_trait_output/baselines_jbshield_fjd":
+            args.output_dir = "full_trait_output/baselines_jbshield_fjd_olmo3"
+    datasets = DATASETS_GEMMA if args.gemma else (DATASETS_OLMO3 if args.olmo3 else DATASETS)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -483,34 +607,53 @@ def main():
     jailbreak_templates = fetch_jailbreaks()
     rows_by_name = {}
     prompt_maps = {}
-    for name, cfg in DATASETS.items():
+    for name, cfg in datasets.items():
         rows_path = Path(cfg["responses"])
         if not rows_path.exists():
             logger.warning(f"Skipping {name}: missing {rows_path}")
             continue
-        rows = filter_rows(name, load_jsonl(rows_path))
+        rows = filter_rows(cfg, load_jsonl(rows_path))
         if args.test:
             rows = test_subset(rows)
         rows_by_name[name] = rows
         if name == "HarmBench":
             prompt_maps[name] = build_prompt_map_harmbench(
                 cfg["metadata"], cfg["responses"], jailbreak_templates)
+        elif args.olmo3 or args.gemma:
+            prompt_maps[name] = build_prompt_map_generic(rows, load_olmo3_test_cases(name, cfg["exp"]))
         else:
-            prompt_maps[name] = build_prompt_map_generic(rows, cfg["test_cases"])
+            prompt_maps[name] = build_prompt_map_generic(rows, json.load(open(cfg["test_cases"])))
         logger.info(f"  {name}: {len(rows)} rows")
+
+    # WJB calibration channel (HB+WJB): rows for FJD scoring + acts for JBShield. Folded
+    # into the per-seed TRAIN pool only; never added to rows_by_name (would hit eval loop).
+    wjb_rows = wjb_prompt_map = None
+    if args.augment_wjb:
+        wjb_rows = load_jsonl(Path("full_trait_output/wildjailbreak_activations_gemma/classified_responses.jsonl"))
+        if args.test:
+            wjb_rows = wjb_rows[:20]
+        wjb_prompt_map = {r["pair_id"]: r["behavior_text"] for r in wjb_rows}
+        logger.info(f"  WJB calibration augment: {len(wjb_rows)} rows")
 
     results = {}
     if args.baseline in ("both", "jbshield"):
         acts_by_name = {}
         for name in rows_by_name:
-            acts_path = Path(DATASETS[name]["activations"])
+            acts_path = Path(datasets[name]["activations"])
             if not acts_path.exists():
                 raise FileNotFoundError(f"Missing activations for {name}: {acts_path}")
             acts_by_name[name] = load_activations(acts_path)
-        results["jbshield_mean_direction"] = run_jbshield(rows_by_name, acts_by_name, args)
+        wjb_X = wjb_y = None
+        if args.augment_wjb:
+            wjb_acts = load_activations(Path("full_trait_output/wildjailbreak_activations_gemma/activations.pt"))
+            wjb_X, wjb_y, _ = build_activation_matrix(wjb_rows, wjb_acts, args.layer)
+            logger.info(f"  JBShield WJB augment: X={wjb_X.shape}, jb={int(wjb_y.sum())}/{len(wjb_y)}")
+        results["jbshield_mean_direction"] = run_jbshield(rows_by_name, acts_by_name, args,
+                                                          wjb_X=wjb_X, wjb_y=wjb_y)
 
     if args.baseline in ("both", "fjd"):
-        results["fjd_sure_logprob"] = run_fjd(rows_by_name, prompt_maps, args)
+        results["fjd_sure_logprob"] = run_fjd(rows_by_name, prompt_maps, args,
+                                              wjb_rows=wjb_rows, wjb_prompt_map=wjb_prompt_map)
 
     print_summary(results)
     out_path = output_dir / "jbshield_fjd_results.json"
@@ -519,7 +662,8 @@ def main():
             "model": args.model,
             "layer": args.layer,
             "n_seeds": args.n_seeds,
-            "train_source": "HarmBench human_jailbreak train pools only",
+            "train_source": ("HarmBench human_jailbreak + WildJailbreak (HB+WJB) train pools"
+                             if args.augment_wjb else "HarmBench human_jailbreak train pools only"),
             "results": results,
         }, f, indent=2)
     logger.info(f"Saved to {out_path}")

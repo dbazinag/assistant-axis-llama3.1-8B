@@ -41,7 +41,16 @@ ENV/
 # Outputs
 outputs/
 *.parquet
+full_trait_output/
+*.tar.gz
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Local agent/editor config
+.claude/
+
+*.sh
+
+report/

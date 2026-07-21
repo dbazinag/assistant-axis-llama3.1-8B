@@ -188,6 +188,10 @@ def main():
     parser.add_argument("--gcg_activations_path",  default="full_trait_output/gcg_activations/activations.pt")
     parser.add_argument("--pair_classified_path",  default="full_trait_output/pair_activations/responses.jsonl")
     parser.add_argument("--pair_activations_path", default="full_trait_output/pair_activations/activations.pt")
+    parser.add_argument("--pap_classified_path",   default="full_trait_output/pap_activations/responses.jsonl")
+    parser.add_argument("--pap_activations_path",  default="full_trait_output/pap_activations/activations.pt")
+    parser.add_argument("--augment_classified_path",  default="", help="comma-separated classified jsonl paths folded into the TRAIN pool each seed")
+    parser.add_argument("--augment_activations_path", default="", help="comma-separated activations.pt paths matching --augment_classified_path")
     parser.add_argument("--trait_vectors_dir",     default="full_trait_output/traits40_vectors/pre_generation_last_token/filter_matched_pairs_ge_50_count_ge_10_total")
     parser.add_argument("--hyperplane_path",       default="full_trait_output/harmbench_logreg/stable_hyperplane_layer16.pt")
     parser.add_argument("--output_dir",            default="full_trait_output/transfer_results_all")
@@ -219,6 +223,27 @@ def main():
     pair_acts = load_activations(Path(args.pair_activations_path))
     print(f"  {len(pair_rows)} PAIR rows")
 
+    print("PAP data...")
+    pap_rows = load_jsonl(Path(args.pap_classified_path))
+    pap_acts = load_activations(Path(args.pap_activations_path))
+    print(f"  {len(pap_rows)} PAP rows")
+
+    # Augment sources folded into the TRAIN pool each seed (eval stays pure)
+    aug_X_raw_list, aug_y_list = [], []
+    if args.augment_classified_path:
+        aug_cls = [p for p in args.augment_classified_path.split(",") if p]
+        aug_act = [p for p in args.augment_activations_path.split(",") if p]
+        assert len(aug_cls) == len(aug_act), "augment classified/activations path counts differ"
+        for cpath, apath in zip(aug_cls, aug_act):
+            print(f"Augment source: {cpath}")
+            a_rows = load_jsonl(Path(cpath))
+            a_acts = load_activations(Path(apath))
+            Xa, ya, _ = build_activation_matrix(a_rows, a_acts, args.layer)
+            print(f"  {len(ya)} augment rows ({int(ya.sum()) if len(ya) else 0} jb)")
+            if len(ya):
+                aug_X_raw_list.append(Xa)
+                aug_y_list.append(ya)
+
     print("Trait vectors...")
     trait_matrix, trait_names = load_trait_matrix(Path(args.trait_vectors_dir), args.layer)
 
@@ -235,10 +260,17 @@ def main():
     X_human_raw, y_human, human_valid = build_activation_matrix(human_rows, human_acts, args.layer)
     X_gcg_raw,   y_gcg,   gcg_valid   = build_activation_matrix(gcg_rows,   gcg_acts,   args.layer)
     X_pair_raw,  y_pair,  pair_valid  = build_activation_matrix(pair_rows,  pair_acts,  args.layer)
+    X_pap_raw,   y_pap,   pap_valid   = build_activation_matrix(pap_rows,   pap_acts,   args.layer)
 
     print(f"  Human: {len(y_human)} pairs ({y_human.sum():.0f} jb)")
     print(f"  GCG:   {len(y_gcg)} pairs ({y_gcg.sum():.0f} jb), chance={y_gcg.mean():.3f}")
     print(f"  PAIR:  {len(y_pair)} pairs ({y_pair.sum():.0f} jb), chance={y_pair.mean():.3f}")
+    print(f"  PAP:   {len(y_pap)} pairs ({y_pap.sum():.0f} jb), chance={y_pap.mean():.3f}")
+
+    X_aug_raw = np.vstack(aug_X_raw_list) if aug_X_raw_list else None
+    y_aug     = np.concatenate(aug_y_list) if aug_y_list else None
+    if X_aug_raw is not None:
+        print(f"  Augment (train-only): {len(y_aug)} pairs ({y_aug.sum():.0f} jb)")
 
     # ── Pre-compute trait projections (single matmul each) ─────────────────────
     print("\n=== Pre-computing trait projections (fast matmul) ===")
@@ -246,12 +278,16 @@ def main():
     X_human_traits = project_traits(X_human_raw, trait_matrix)   # [N_h x 229]
     X_gcg_traits   = project_traits(X_gcg_raw,   trait_matrix)   # [N_gcg x 229]
     X_pair_traits  = project_traits(X_pair_raw,  trait_matrix)   # [N_pair x 229]
+    X_pap_traits   = project_traits(X_pap_raw,   trait_matrix)   # [N_pap x 229]
+    X_aug_traits   = project_traits(X_aug_raw,   trait_matrix) if X_aug_raw is not None else None
     print(f"  Done in {time.time()-t0:.2f}s")
 
     # top_k slice
     X_human_top = X_human_traits[:, top_k_idx]
     X_gcg_top   = X_gcg_traits[:,   top_k_idx]
     X_pair_top  = X_pair_traits[:,   top_k_idx]
+    X_pap_top   = X_pap_traits[:,    top_k_idx]
+    X_aug_top   = X_aug_traits[:,    top_k_idx] if X_aug_traits is not None else None
 
     # feature sets per mode
     def get_features(mode, X_raw, X_traits, X_top):
@@ -277,7 +313,7 @@ def main():
     print(f"\n=== Transfer experiment ({args.n_seeds} seeds) ===")
 
     # Accumulators: {mode: {dataset: [auc_per_seed]}}
-    results = {mode: {"gcg": [], "pair": [], "human_test": []} for mode in modes}
+    results = {mode: {"gcg": [], "pair": [], "pap": [], "human_test": []} for mode in modes}
 
     for seed in range(args.n_seeds):
         train_beh, train_tpl, test_beh, test_tpl = get_pool_split(
@@ -291,19 +327,28 @@ def main():
             continue
 
         for mode in modes:
-            X_h = get_features(mode, X_human_raw, X_human_traits, X_human_top)
-            X_g = get_features(mode, X_gcg_raw,   X_gcg_traits,   X_gcg_top)
-            X_p = get_features(mode, X_pair_raw,  X_pair_traits,  X_pair_top)
+            X_h  = get_features(mode, X_human_raw, X_human_traits, X_human_top)
+            X_g  = get_features(mode, X_gcg_raw,   X_gcg_traits,   X_gcg_top)
+            X_p  = get_features(mode, X_pair_raw,  X_pair_traits,  X_pair_top)
+            X_pp = get_features(mode, X_pap_raw,   X_pap_traits,   X_pap_top)
 
             X_tr = X_h[train_idx];  y_tr = y_human[train_idx]
             X_te = X_h[test_idx];   y_te = y_human[test_idx]
 
-            auc_gcg       = fit_eval(X_tr, y_tr, X_g, y_gcg,  mode, args.n_pca)
-            auc_pair      = fit_eval(X_tr, y_tr, X_p, y_pair, mode, args.n_pca)
+            # fold augment families into the training pool (eval stays pure)
+            if X_aug_raw is not None:
+                X_a = get_features(mode, X_aug_raw, X_aug_traits, X_aug_top)
+                X_tr = np.vstack([X_tr, X_a])
+                y_tr = np.concatenate([y_tr, y_aug])
+
+            auc_gcg       = fit_eval(X_tr, y_tr, X_g,  y_gcg,  mode, args.n_pca)
+            auc_pair      = fit_eval(X_tr, y_tr, X_p,  y_pair, mode, args.n_pca)
+            auc_pap       = fit_eval(X_tr, y_tr, X_pp, y_pap,  mode, args.n_pca)
             auc_human_test = fit_eval(X_tr, y_tr, X_te, y_te,  mode, args.n_pca)
 
             results[mode]["gcg"].append(auc_gcg)
             results[mode]["pair"].append(auc_pair)
+            results[mode]["pap"].append(auc_pap)
             results[mode]["human_test"].append(auc_human_test)
 
         print(f"  Seed {seed} done")
@@ -314,7 +359,7 @@ def main():
     print(f"  FULL TRANSFER SUMMARY  |  Layer {args.layer}  |  n_pca={args.n_pca}  |  top_k={args.top_k}  |  {args.n_seeds} seeds")
     print(sep)
 
-    header = f"  {'Mode':12s}  {'Human CV':>12}  {'→GCG (mean)':>13}  {'→GCG (std)':>12}  {'→PAIR (mean)':>14}  {'→PAIR (std)':>12}  {'Human test':>12}"
+    header = f"  {'Mode':12s}  {'Human CV':>12}  {'→GCG (mean)':>13}  {'→GCG (std)':>12}  {'→PAIR (mean)':>14}  {'→PAIR (std)':>12}  {'→PAP (mean)':>13}  {'Human test':>12}"
     print(f"\n{header}")
     print("  " + "─" * 96)
 
@@ -323,33 +368,40 @@ def main():
         h_cv, h_cv_std     = human_cv[mode]
         gcg_aucs           = results[mode]["gcg"]
         pair_aucs          = results[mode]["pair"]
+        pap_aucs           = results[mode]["pap"]
         ht_aucs            = results[mode]["human_test"]
 
         gcg_mean  = float(np.mean(gcg_aucs))
         gcg_std   = float(np.std(gcg_aucs))
         pair_mean = float(np.mean(pair_aucs))
         pair_std  = float(np.std(pair_aucs))
+        pap_mean  = float(np.mean(pap_aucs))
+        pap_std   = float(np.std(pap_aucs))
         ht_mean   = float(np.mean(ht_aucs))
 
-        print(f"  {mode:12s}  {h_cv:>12.4f}  {gcg_mean:>13.4f}  {gcg_std:>12.4f}  {pair_mean:>14.4f}  {pair_std:>12.4f}  {ht_mean:>12.4f}")
+        print(f"  {mode:12s}  {h_cv:>12.4f}  {gcg_mean:>13.4f}  {gcg_std:>12.4f}  {pair_mean:>14.4f}  {pair_std:>12.4f}  {pap_mean:>13.4f}  {ht_mean:>12.4f}")
 
         summary[mode] = {
             "human_cv": {"mean": h_cv, "std": h_cv_std},
             "transfer_gcg":  {"mean": gcg_mean,  "std": gcg_std,  "all": gcg_aucs},
             "transfer_pair": {"mean": pair_mean, "std": pair_std, "all": pair_aucs},
+            "transfer_pap":  {"mean": pap_mean,  "std": pap_std,  "all": pap_aucs},
             "human_test":    {"mean": ht_mean,   "all": ht_aucs},
         }
 
     print(f"\n  GCG chance baseline:  {y_gcg.mean():.4f}")
     print(f"  PAIR chance baseline: {y_pair.mean():.4f}")
+    print(f"  PAP chance baseline:  {y_pap.mean():.4f}")
     print(sep)
 
     # Save
     out = {
         "layer": args.layer, "n_pca": args.n_pca, "top_k": args.top_k,
         "n_seeds": args.n_seeds,
+        "augment_classified_path": args.augment_classified_path,
         "gcg_chance":  float(y_gcg.mean()),
         "pair_chance": float(y_pair.mean()),
+        "pap_chance":  float(y_pap.mean()),
         "top_trait_names": top_trait_names,
         "modes": summary,
     }

@@ -105,6 +105,50 @@ DATASETS = {
     },
 }
 
+DATASETS_OLMO3 = {
+    "HarmBench": {
+        "responses":   "full_trait_output/harmbench_activations_olmo3/classified_responses.jsonl",
+        "metadata":    "full_trait_output/harmbench_activations_olmo3/pairs_metadata.jsonl",
+        "test_cases":  None,
+        "attack_type": "human_jailbreak",
+    },
+    "PAIR": {
+        "responses":  "full_trait_output/pair_activations_olmo3_hb/classified_responses.jsonl",
+        "test_cases": None,
+    },
+    "PAP": {
+        "responses":  "full_trait_output/pap_activations_olmo3_hb/classified_responses.jsonl",
+        "test_cases": None,
+    },
+    "GPTFuzz": {
+        "responses":  "full_trait_output/gptfuzz_activations_olmo3_hb/classified_responses.jsonl",
+        "test_cases": None,
+    },
+    "PEZ": {
+        "responses":  "full_trait_output/pez_activations_olmo3_hb/classified_responses.jsonl",
+        "test_cases": None,
+    },
+}
+
+MODEL_NAME_GEMMA = ("/mnt/dlabscratch1/bazina/.cache/huggingface/hub/"
+                    "models--google--gemma-4-31B-it/snapshots/"
+                    "fb9ae262347c3945692f09a612f8bb189def854f")
+
+
+def _olmo3_to_gemma(cfg):
+    """Gemma reuses the OLMo3 test_cases/exp; only the full_trait_output data paths change."""
+    out = {}
+    for name, c in cfg.items():
+        c2 = dict(c)
+        for k, v in c2.items():
+            if isinstance(v, str) and "full_trait_output" in v:
+                c2[k] = v.replace("_olmo3", "_gemma")
+        out[name] = c2
+    return out
+
+
+DATASETS_GEMMA = _olmo3_to_gemma(DATASETS_OLMO3)
+
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 
@@ -151,6 +195,10 @@ def build_prompt_map_harmbench(metadata_path, responses_path, jailbreak_template
         else:
             pm[pid] = bt
     return pm
+
+
+def build_prompt_map_behavior_text(responses):
+    return {r["pair_id"]: r.get("behavior_text", "") for r in responses}
 
 
 def build_prompt_map_generic(responses, test_cases_path):
@@ -264,7 +312,23 @@ def main():
     parser.add_argument("--output_dir", default="full_trait_output/baselines_all_attacks")
     parser.add_argument("--device",     default="cuda")
     parser.add_argument("--test",       action="store_true")
+    parser.add_argument("--olmo3",      action="store_true",
+                        help="Use OLMo-3-7B-Instruct and OLMo-3 response paths")
+    parser.add_argument("--gemma",      action="store_true",
+                        help="Use Gemma-4-31B-it and Gemma response paths")
     args = parser.parse_args()
+
+    datasets = DATASETS_GEMMA if args.gemma else (DATASETS_OLMO3 if args.olmo3 else DATASETS)
+    if args.gemma:
+        if args.model == MODEL_NAME:
+            args.model = MODEL_NAME_GEMMA
+        if args.output_dir == "full_trait_output/baselines_all_attacks":
+            args.output_dir = "full_trait_output/baselines_all_attacks_gemma"
+    elif args.olmo3:
+        if args.model == MODEL_NAME:
+            args.model = "allenai/OLMo-3-7B-Instruct"
+        if args.output_dir == "full_trait_output/baselines_all_attacks":
+            args.output_dir = "full_trait_output/baselines_all_attacks_olmo3"
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -276,20 +340,28 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     logger.info(f"Loading {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    trust_remote = args.olmo3 or args.gemma
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=trust_remote)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    extra = {"attn_implementation": "sdpa"} if args.gemma else {}  # Gemma-4 head_dim=512
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, device_map={"": device})
+        args.model, dtype=torch.bfloat16, device_map={"": device},
+        trust_remote_code=trust_remote, **extra)
     model.eval()
     logger.info("Model loaded.")
+
+    # Gemma-4 needs chunked SDPA around every forward/generate; patch for the rest of the run.
+    if args.gemma:
+        from chunked_sdpa import chunked_sdpa_scope
+        chunked_sdpa_scope().__enter__()
 
     logger.info("Fetching jailbreak templates...")
     jailbreak_templates = fetch_jailbreaks()
 
     results = {}
 
-    for name, cfg in DATASETS.items():
+    for name, cfg in datasets.items():
         if not Path(cfg["responses"]).exists():
             logger.warning(f"Skipping {name} — not found")
             continue
@@ -306,6 +378,8 @@ def main():
         if name == "HarmBench":
             prompt_map = build_prompt_map_harmbench(
                 cfg["metadata"], cfg["responses"], jailbreak_templates)
+        elif cfg["test_cases"] is None:
+            prompt_map = build_prompt_map_behavior_text(rows)
         else:
             prompt_map = build_prompt_map_generic(rows, cfg["test_cases"])
 

@@ -120,6 +120,14 @@ async def main_async() -> None:
         default="full_trait_output/harmbench_activations/classified_responses.jsonl",
     )
     parser.add_argument(
+        "--responses_path", type=str, default=None,
+        help=(
+            "Path to responses.jsonl from collect_harmbench_activations.py. "
+            "If --classified_path does not exist, this file is used to initialise "
+            "classified_responses.jsonl with jailbroken=false for every row."
+        ),
+    )
+    parser.add_argument(
         "--judge_model", type=str,
         default="gpt-4.1-mini",
     )
@@ -147,8 +155,27 @@ async def main_async() -> None:
 
     classified_path = Path(args.classified_path)
     if not classified_path.exists():
-        logger.error(f"File not found: {classified_path}")
-        sys.exit(1)
+        if args.responses_path and Path(args.responses_path).exists():
+            logger.info(
+                f"{classified_path} not found — initialising from {args.responses_path}"
+            )
+            responses_path = Path(args.responses_path)
+            init_rows = []
+            with open(responses_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        row = json.loads(line)
+                        row.setdefault("jailbroken", False)
+                        init_rows.append(row)
+            classified_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(classified_path, "w", encoding="utf-8") as f:
+                for row in init_rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            logger.info(f"Initialised {len(init_rows)} rows → {classified_path}")
+        else:
+            logger.error(f"File not found: {classified_path} (pass --responses_path to initialise)")
+            sys.exit(1)
 
     # ── Load rows ──────────────────────────────────────────────────────────────
     rows = load_rows(classified_path)
